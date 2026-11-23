@@ -15,7 +15,7 @@ PLATFORMS: list[Platform] = [Platform.SENSOR]
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Colorado Springs Utilities from a config entry."""
 
-    coordinator = CsuCoordinator(hass, entry.data)
+    coordinator = CsuCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 

@@ -3,6 +3,7 @@
 import dataclasses
 import json
 import logging
+import time
 from datetime import datetime
 from datetime import timedelta
 from enum import Enum
@@ -17,6 +18,9 @@ from .const import TIME_ZONE
 from .const import USER_AGENT
 from .exceptions import CannotConnect
 from .exceptions import InvalidAuth
+from .exceptions import MfaRequired
+
+TOKEN_URL = "https://myaccount.csu.org/rest/oauth/token"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -119,49 +123,105 @@ class CSU:
     """Class that can get historical usage/cost from Colorado Springs Utilities."""
 
     def __init__(
-        self, session: aiohttp.ClientSession, username: str, password: str
+        self,
+        session: aiohttp.ClientSession,
+        username: str,
+        password: str,
+        mfa: str = "",
     ) -> None:
         """Initialize the class."""
 
         self.session = session
         self.username = username
         self.password = password
+        self.mfa = mfa
+        self.customer_id = ""
         self.access_token = ""
+        self._token_expires_at = 0.0
         self.customers = []
         self.meters = []
 
-    async def async_login(self) -> None:
-        """Login to the API."""
+    async def _async_request_token(self, fields: dict[str, str]) -> dict[str, Any]:
+        """Call the OAuth token endpoint, mapping failures to our exceptions."""
 
-        customerId = ""
         data = aiohttp.FormData()
-        data.add_field("username", self.username)
-        data.add_field("password", self.password)
-        data.add_field("mfa", "")
-        data.add_field("grant_type", "password")
+        for key, value in fields.items():
+            data.add_field(key, value)
         try:
             async with self.session.post(
-                "https://myaccount.csu.org/rest/oauth/token",
+                TOKEN_URL,
                 data=data,
                 headers={
                     "User-Agent": USER_AGENT,
                     "Authorization": "Basic d2ViQ2xpZW50SWRQYXNzd29yZDpzZWNyZXQ=",
                 },
-                raise_for_status=True,
             ) as resp:
-                result = await resp.json()
-                if "errorMsg" in result:
-                    raise InvalidAuth(result["errorMsg"])
-
-                self.access_token = result["access_token"]
-                customerId = result["user"]["customerId"]
-                # self.customers.append(Customer(customerId=result['user']["customerId"]))
-
-        except ClientResponseError as err:
-            if err.status in (401, 403):
-                raise InvalidAuth(err) from err
-
+                status = resp.status
+                result = await resp.json(content_type=None)
+        except (aiohttp.ClientError, TimeoutError, ValueError) as err:
             raise CannotConnect(err) from err
+        if status in (400, 401, 403) or "error" in result or "errorMsg" in result:
+            # The server reports a missing/needed one-time code as an invalid_grant
+            # whose description starts with BUS-MFAR, and has already sent the code.
+            description = str(
+                result.get("error_description") or result.get("errorMsg") or status
+            )
+            if description.startswith("BUS-MFAR"):
+                raise MfaRequired(description)
+            raise InvalidAuth(description)
+        if status >= 400:
+            raise CannotConnect(f"HTTP {status}")
+        return result
+
+    async def async_send_mfa_code(self, mfa_token: str) -> None:
+        """Ask CSU to email the one-time code for a BUS-MFAR challenge.
+
+        The token request itself sends nothing; the portal makes this separate call.
+        """
+        try:
+            async with self.session.post(
+                "https://myaccount.csu.org/rest/auth/mfa/verificationcode",
+                data=json.dumps({"mfaToken": mfa_token, "customerId": "guest"}),
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Content-Type": "application/json",
+                },
+                raise_for_status=True,
+            ):
+                pass
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise CannotConnect(err) from err
+
+    async def _async_ensure_token(self) -> None:
+        """Get a valid access token, logging in only when the last one expired."""
+
+        # The server does not support refresh tokens, and a login may need an MFA
+        # code, so keep logins to about one per token lifetime.
+        if self.access_token and time.monotonic() < self._token_expires_at - 60:
+            return
+        result = await self._async_request_token(
+            {
+                "username": self.username,
+                "password": self.password,
+                # SKIP is what the portal sends when it has no code. The server
+                # accepts it when no code is needed, whereas an empty value
+                # always demands one.
+                "mfa": self.mfa or "SKIP",
+                "grant_type": "password",
+            }
+        )
+        self.mfa = ""
+        self.access_token = result["access_token"]
+        self._token_expires_at = time.monotonic() + float(
+            result.get("expires_in", 3600)
+        )
+        self.customer_id = result["user"]["customerId"]
+
+    async def async_login(self) -> None:
+        """Login to the API."""
+
+        await self._async_ensure_token()
+        customerId = self.customer_id
 
         try:
             async with self.session.post(

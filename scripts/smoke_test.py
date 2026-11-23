@@ -84,7 +84,7 @@ async def main() -> int:
     start = midnight - timedelta(days=days)
 
     async with aiohttp.ClientSession() as session:
-        api = csu.CSU(session, username, password)
+        api = csu.CSU(session, username, password, os.environ.get("CSU_MFA", ""))
         await api.async_login()
         print(f"Logged in. Customers: {[mask(c.customer_id) for c in api.customers]}")
         await api.async_get_meters()

@@ -3,7 +3,6 @@
 import logging
 from datetime import datetime
 from datetime import timedelta
-from types import MappingProxyType
 from typing import Any
 from typing import cast
 
@@ -17,6 +16,7 @@ from homeassistant.components.recorder.statistics import async_add_external_stat
 from homeassistant.components.recorder.statistics import get_last_statistics  # type: ignore
 from homeassistant.components.recorder.statistics import statistics_during_period  # type: ignore
 from homeassistant.components.recorder.statistics import valid_statistic_id  # type: ignore
+from homeassistant.config_entries import ConfigEntry  # type: ignore
 from homeassistant.const import CONF_PASSWORD  # type: ignore
 from homeassistant.const import CONF_USERNAME  # type: ignore
 from homeassistant.const import UnitOfEnergy  # type: ignore
@@ -47,13 +47,14 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
     def __init__(
         self,
         hass: HomeAssistant,
-        entry_data: MappingProxyType[str, Any],
+        entry: ConfigEntry,
     ) -> None:
         """Initialize the data handler."""
 
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=entry,
             name="Csu",
             update_interval=timedelta(
                 minutes=5
@@ -61,8 +62,8 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         )
         self.api = CSU(
             aiohttp_client.async_get_clientsession(hass),
-            entry_data[CONF_USERNAME],
-            entry_data[CONF_PASSWORD],
+            entry.data[CONF_USERNAME],
+            entry.data[CONF_PASSWORD],
         )
         self.entities = []
         self.data = {
@@ -85,6 +86,7 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         try:
             await self.api.async_login()
         except InvalidAuth as err:
+            # Includes MfaRequired: a new one-time code needs the reauth flow.
             raise ConfigEntryAuthFailed from err
         # TODO: Usage Reads works great, but for useful sensors we need to take that data and get current bill usage.
         # If we poll last 12 months we can get 'typical' usage and cost.

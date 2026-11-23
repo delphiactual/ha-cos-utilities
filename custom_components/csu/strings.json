@@ -3,19 +3,35 @@
     "step": {
       "user": {
         "data": {
-          "host": "[%key:common::config_flow::data::host%]",
           "username": "[%key:common::config_flow::data::username%]",
           "password": "[%key:common::config_flow::data::password%]"
+        },
+        "description": "Sign in to your CSU account. If it uses a one-time code, CSU will send one next."
+      },
+      "mfa": {
+        "title": "One-time code",
+        "description": "CSU sent a one-time code to you. Enter it below.",
+        "data": {
+          "mfa_code": "Code"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Sign in again",
+        "description": "CSU needs you to sign in again. Enter your password; a one-time code will be sent next.",
+        "data": {
+          "password": "Password"
         }
       }
     },
     "error": {
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
       "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
-      "unknown": "[%key:common::config_flow::error::unknown%]"
+      "unknown": "[%key:common::config_flow::error::unknown%]",
+      "invalid_mfa": "That code was not accepted. Start over to get a new code."
     },
     "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
+      "reauth_successful": "Re-authentication was successful"
     }
   },
   "options": {

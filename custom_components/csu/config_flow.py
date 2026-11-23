@@ -1,4 +1,5 @@
 """Config flow for Colorado Springs Utilities integration."""
+
 from __future__ import annotations
 
 import logging
@@ -11,15 +12,18 @@ from homeassistant.config_entries import ConfigFlow  # type: ignore
 from homeassistant.config_entries import ConfigFlowResult  # type: ignore
 from homeassistant.config_entries import CONN_CLASS_CLOUD_POLL  # type: ignore
 from homeassistant.config_entries import OptionsFlow  # type: ignore
+from homeassistant.config_entries import SOURCE_REAUTH  # type: ignore
 from homeassistant.const import CONF_PASSWORD  # type: ignore
 from homeassistant.const import CONF_USERNAME  # type: ignore
 from homeassistant.core import HomeAssistant  # type: ignore
 from homeassistant.helpers.aiohttp_client import async_create_clientsession  # type: ignore
 
+from .const import CONF_MFA_CODE
 from .const import DOMAIN
 from .csu import CannotConnect
 from .csu import CSU
 from .csu import InvalidAuth
+from .exceptions import MfaRequired
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,18 +36,29 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 
 
 async def _validate_login(
-    hass: HomeAssistant, login_data: dict[str, str]
+    hass: HomeAssistant, login_data: Mapping[str, Any], mfa: str = ""
 ) -> dict[str, str]:
-    """Validate login data and return any errors."""
+    """Try a login and return any errors."""
 
     api = CSU(
         async_create_clientsession(hass),
         login_data[CONF_USERNAME],
         login_data[CONF_PASSWORD],
+        mfa,
     )
     errors: dict[str, str] = {}
     try:
         await api.async_login()
+    except MfaRequired as err:
+        if mfa:
+            errors["base"] = "invalid_mfa"
+        else:
+            # The login itself sends nothing; ask CSU to email the code.
+            try:
+                await api.async_send_mfa_code(err.mfa_token)
+                errors["base"] = "mfa_required"
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
     except InvalidAuth:
         errors["base"] = "invalid_auth"
     except CannotConnect:
@@ -59,33 +74,63 @@ class CSUConfigFlow(ConfigFlow, domain=DOMAIN):
 
     def __init__(self) -> None:
         """Initialize a new CSUConfigFlow."""
-        self.reauth_entry: ConfigEntry | None = None
+        self._login_data: dict[str, Any] = {}
 
     @staticmethod
     def async_get_options_flow(config_entry: ConfigEntry):
         """Get the options flow for this handler."""
-        return CSUOptionsFlow(config_entry)
+        return CSUOptionsFlow()
+
+    async def _async_login_step(
+        self, step_id: str, schema: vol.Schema, user_input: dict[str, Any]
+    ) -> ConfigFlowResult:
+        """Log in; ask for the emailed/texted code if the account needs one."""
+
+        self._login_data = dict(user_input)
+        errors = await _validate_login(self.hass, self._login_data)
+        if errors.get("base") == "mfa_required":
+            return await self.async_step_mfa()
+        if errors:
+            return self.async_show_form(
+                step_id=step_id, data_schema=schema, errors=errors
+            )
+        return self._async_finish(self._login_data)
+
+    def _async_finish(self, data: dict[str, Any]) -> ConfigFlowResult:
+        if self.source == SOURCE_REAUTH:
+            return self.async_update_reload_and_abort(
+                self._get_reauth_entry(), data=data
+            )
+        return self.async_create_entry(title=f"CSU - {data[CONF_USERNAME]}", data=data)
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Handle the initial step."""
 
+        if user_input is None:
+            return self.async_show_form(
+                step_id="user", data_schema=STEP_USER_DATA_SCHEMA
+            )
+        self._async_abort_entries_match({CONF_USERNAME: user_input[CONF_USERNAME]})
+        return await self._async_login_step("user", STEP_USER_DATA_SCHEMA, user_input)
+
+    async def async_step_mfa(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask for the one-time code CSU just sent."""
+
         errors: dict[str, str] = {}
         if user_input is not None:
-            self._async_abort_entries_match(
-                {
-                    CONF_USERNAME: user_input[CONF_USERNAME],
-                }
+            errors = await _validate_login(
+                self.hass, self._login_data, user_input[CONF_MFA_CODE].strip()
             )
-            errors = await _validate_login(self.hass, user_input)
             if not errors:
-                return self.async_create_entry(
-                    title=f"'CSU - {user_input[CONF_USERNAME]}",
-                    data=user_input,
-                )
+                return self._async_finish(self._login_data)
         return self.async_show_form(
-            step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
+            step_id="mfa",
+            data_schema=vol.Schema({vol.Required(CONF_MFA_CODE): str}),
+            errors=errors,
         )
 
     async def async_step_reauth(
@@ -93,9 +138,6 @@ class CSUConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Handle configuration by re-auth."""
 
-        self.reauth_entry = self.hass.config_entries.async_get_entry(
-            self.context["entry_id"]
-        )
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
@@ -103,37 +145,26 @@ class CSUConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Dialog that informs the user that reauth is required."""
 
-        assert self.reauth_entry
-        errors: dict[str, str] = {}
-        if user_input is not None:
-            data = {**self.reauth_entry.data, **user_input}
-            errors = await _validate_login(self.hass, data)
-            if not errors:
-                self.hass.config_entries.async_update_entry(
-                    self.reauth_entry, data=data
-                )
-                await self.hass.config_entries.async_reload(self.reauth_entry.entry_id)
-                return self.async_abort(reason="reauth_successful")
-        return self.async_show_form(
-            step_id="reauth_confirm",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_USERNAME): self.reauth_entry.data[CONF_USERNAME],
-                    vol.Required(CONF_PASSWORD): str,
-                }
-            ),
-            errors=errors,
+        entry = self._get_reauth_entry()
+        schema = vol.Schema({vol.Required(CONF_PASSWORD): str})
+        if user_input is None:
+            return self.async_show_form(step_id="reauth_confirm", data_schema=schema)
+        return await self._async_login_step(
+            "reauth_confirm",
+            schema,
+            {**entry.data, CONF_PASSWORD: user_input[CONF_PASSWORD]},
         )
 
 
 class CSUOptionsFlow(OptionsFlow):
     """Options flow for the integration."""
 
-    def __init__(self, config_entry: ConfigEntry) -> None:
-        """Initialize options flow."""
-
-        self.config_entry = config_entry
-        self.options = dict(config_entry.options)
+    @property
+    def options(self) -> dict[str, Any]:
+        """Working copy of the entry options."""
+        if not hasattr(self, "_options"):
+            self._options = dict(self.config_entry.options)
+        return self._options
 
     async def async_step_init(self, user_input=None):
         """Manage the options."""
