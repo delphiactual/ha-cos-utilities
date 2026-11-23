@@ -1,6 +1,7 @@
 {
   "domain": "csu",
   "name": "Colorado Springs Utilities",
+  "categories": ["energy.meters_monitoring"],
   "codeowners": ["@delphiactual"],
   "config_flow": true,
   "dependencies": ["recorder"],
