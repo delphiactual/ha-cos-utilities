@@ -167,8 +167,8 @@ def reconcile_hourly_with_daily(
             meter=meter,
             start_time=hour.astimezone(tz),
             end_time=hour.astimezone(tz) + timedelta(hours=1),
-            consumption=round(imp, 4),
-            received=round(exp, 4),
+            consumption=imp,
+            received=exp,
         )
         for hour, (imp, exp, tz) in sorted(hours.items())
     ]
