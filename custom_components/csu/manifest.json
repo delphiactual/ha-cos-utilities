@@ -1,7 +1,7 @@
 {
   "domain": "csu",
   "name": "Colorado Springs Utilities",
-  "codeowners": ["@hartd92"],
+  "codeowners": ["@delphiactual"],
   "config_flow": true,
   "dependencies": ["recorder"],
   "documentation": "https://github.com/delphiactual/ha-cos-utilities",
@@ -10,6 +10,6 @@
   "issue_tracker": "https://github.com/delphiactual/ha-cos-utilities/issues",
   "requirements": [],
   "ssdp": [],
-  "version": "0.2.0",
+  "version": "0.2.1",
   "zeroconf": []
 }

@@ -28,6 +28,9 @@ from homeassistant.helpers import aiohttp_client  # type: ignore
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator  # type: ignore
 from homeassistant.util import dt as dt_util  # type: ignore
 
+from .const import CONF_ACCESS_TOKEN
+from .const import CONF_CUSTOMER_ID
+from .const import CONF_TOKEN_EXPIRES_AT
 from .const import DOMAIN
 from .const import TIME_ZONE
 from .csu import AggregateType
@@ -56,14 +59,15 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             _LOGGER,
             config_entry=entry,
             name="Csu",
-            update_interval=timedelta(
-                minutes=5
-            ),  # TODO: Change to 12 Hours when testing is done.
+            update_interval=timedelta(hours=3),
         )
         self.api = CSU(
             aiohttp_client.async_get_clientsession(hass),
             entry.data[CONF_USERNAME],
             entry.data[CONF_PASSWORD],
+            access_token=entry.data.get(CONF_ACCESS_TOKEN, ""),
+            token_expires_at=entry.data.get(CONF_TOKEN_EXPIRES_AT, 0.0),
+            customer_id=entry.data.get(CONF_CUSTOMER_ID, ""),
         )
         self.entities = []
         self.data = {
@@ -88,6 +92,7 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         except InvalidAuth as err:
             # Includes MfaRequired: a new one-time code needs the reauth flow.
             raise ConfigEntryAuthFailed from err
+        self._save_token()
         # TODO: Usage Reads works great, but for useful sensors we need to take that data and get current bill usage.
         # If we poll last 12 months we can get 'typical' usage and cost.
         # That will let us make the sensors.
@@ -147,6 +152,18 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
                 self.hass, self._insert_statistics(), "csu_insert_statistics"
             )
         return self.data
+
+    def _save_token(self) -> None:
+        """Keep the current token so a restart can reuse it while it is valid."""
+        saved = {
+            CONF_ACCESS_TOKEN: self.api.access_token,
+            CONF_TOKEN_EXPIRES_AT: self.api.token_expires_at,
+            CONF_CUSTOMER_ID: self.api.customer_id,
+        }
+        if any(self.config_entry.data.get(k) != v for k, v in saved.items()):
+            self.hass.config_entries.async_update_entry(
+                self.config_entry, data={**self.config_entry.data, **saved}
+            )
 
     async def _insert_statistics(self) -> None:
         """Insert CSU statistics; net-metered electric also gets an export series."""

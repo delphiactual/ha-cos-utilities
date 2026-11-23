@@ -18,7 +18,10 @@ from homeassistant.const import CONF_USERNAME  # type: ignore
 from homeassistant.core import HomeAssistant  # type: ignore
 from homeassistant.helpers.aiohttp_client import async_create_clientsession  # type: ignore
 
+from .const import CONF_ACCESS_TOKEN
+from .const import CONF_CUSTOMER_ID
 from .const import CONF_MFA_CODE
+from .const import CONF_TOKEN_EXPIRES_AT
 from .const import DOMAIN
 from .csu import CannotConnect
 from .csu import CSU
@@ -37,8 +40,8 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 
 async def _validate_login(
     hass: HomeAssistant, login_data: Mapping[str, Any], mfa: str = ""
-) -> dict[str, str]:
-    """Try a login and return any errors."""
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Try a login; return any errors and, on success, the token to store."""
 
     api = CSU(
         async_create_clientsession(hass),
@@ -63,7 +66,12 @@ async def _validate_login(
         errors["base"] = "invalid_auth"
     except CannotConnect:
         errors["base"] = "cannot_connect"
-    return errors
+    token = {
+        CONF_ACCESS_TOKEN: api.access_token,
+        CONF_TOKEN_EXPIRES_AT: api.token_expires_at,
+        CONF_CUSTOMER_ID: api.customer_id,
+    }
+    return errors, token
 
 
 class CSUConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -87,14 +95,14 @@ class CSUConfigFlow(ConfigFlow, domain=DOMAIN):
         """Log in; ask for the emailed/texted code if the account needs one."""
 
         self._login_data = dict(user_input)
-        errors = await _validate_login(self.hass, self._login_data)
+        errors, token = await _validate_login(self.hass, self._login_data)
         if errors.get("base") == "mfa_required":
             return await self.async_step_mfa()
         if errors:
             return self.async_show_form(
                 step_id=step_id, data_schema=schema, errors=errors
             )
-        return self._async_finish(self._login_data)
+        return self._async_finish({**self._login_data, **token})
 
     def _async_finish(self, data: dict[str, Any]) -> ConfigFlowResult:
         if self.source == SOURCE_REAUTH:
@@ -122,11 +130,11 @@ class CSUConfigFlow(ConfigFlow, domain=DOMAIN):
 
         errors: dict[str, str] = {}
         if user_input is not None:
-            errors = await _validate_login(
+            errors, token = await _validate_login(
                 self.hass, self._login_data, user_input[CONF_MFA_CODE].strip()
             )
             if not errors:
-                return self._async_finish(self._login_data)
+                return self._async_finish({**self._login_data, **token})
         return self.async_show_form(
             step_id="mfa",
             data_schema=vol.Schema({vol.Required(CONF_MFA_CODE): str}),

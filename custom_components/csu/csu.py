@@ -21,6 +21,8 @@ from .exceptions import InvalidAuth
 from .exceptions import MfaRequired
 
 TOKEN_URL = "https://myaccount.csu.org/rest/oauth/token"
+# Accounts and services rarely change, and usage data lags by a day or more.
+ACCOUNT_REFRESH_SECONDS = 24 * 60 * 60
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -128,6 +130,9 @@ class CSU:
         username: str,
         password: str,
         mfa: str = "",
+        access_token: str = "",
+        token_expires_at: float = 0.0,
+        customer_id: str = "",
     ) -> None:
         """Initialize the class."""
 
@@ -135,9 +140,11 @@ class CSU:
         self.username = username
         self.password = password
         self.mfa = mfa
-        self.customer_id = ""
-        self.access_token = ""
-        self._token_expires_at = 0.0
+        # Epoch seconds, so a token saved by the config flow survives restarts.
+        self.customer_id = customer_id
+        self.access_token = access_token
+        self.token_expires_at = token_expires_at
+        self._accounts_fetched_at = 0.0
         self.customers = []
         self.meters = []
 
@@ -192,13 +199,13 @@ class CSU:
         except (aiohttp.ClientError, TimeoutError) as err:
             raise CannotConnect(err) from err
 
-    async def _async_ensure_token(self) -> None:
-        """Get a valid access token, logging in only when the last one expired."""
+    async def _async_ensure_token(self) -> bool:
+        """Make sure the access token is valid; return True if a new one was issued."""
 
         # The server does not support refresh tokens, and a login may need an MFA
         # code, so keep logins to about one per token lifetime.
-        if self.access_token and time.monotonic() < self._token_expires_at - 60:
-            return
+        if self.access_token and time.time() < self.token_expires_at - 60:
+            return False
         result = await self._async_request_token(
             {
                 "username": self.username,
@@ -212,15 +219,33 @@ class CSU:
         )
         self.mfa = ""
         self.access_token = result["access_token"]
-        self._token_expires_at = time.monotonic() + float(
-            result.get("expires_in", 3600)
-        )
+        self.token_expires_at = time.time() + float(result.get("expires_in", 3600))
         self.customer_id = result["user"]["customerId"]
+        return True
 
     async def async_login(self) -> None:
-        """Login to the API."""
+        """Make sure we have a valid token and a current account context."""
 
-        await self._async_ensure_token()
+        renewed = await self._async_ensure_token()
+        if (
+            not renewed
+            and self.customers
+            and time.time() - self._accounts_fetched_at < ACCOUNT_REFRESH_SECONDS
+        ):
+            return
+        try:
+            await self._async_fetch_accounts()
+        except InvalidAuth:
+            if renewed:
+                raise
+            # A saved token the server no longer accepts: log in once more.
+            self.access_token = ""
+            await self._async_ensure_token()
+            await self._async_fetch_accounts()
+
+    async def _async_fetch_accounts(self) -> None:
+        """Fetch the account context and drop cached meters so they reload."""
+
         customerId = self.customer_id
 
         try:
@@ -234,8 +259,11 @@ class CSU:
                 },
             ) as resp:
                 result = await resp.json()
-                if "errorMsg" in result:
-                    raise InvalidAuth(result["errorMsg"])
+                if "errorMsg" in result or "account" not in result:
+                    # A rejected token comes back as a JSON error without errorMsg.
+                    raise InvalidAuth(
+                        result.get("errorMsg") or result.get("error") or "no account"
+                    )
                 # customerId = customerId
                 customerContext = result["account"][0]
                 # login() runs on every refresh; don't accumulate duplicate customers
@@ -247,6 +275,9 @@ class CSU:
                         customer_id=customerId, customer_context=customerContext
                     )
                 )
+                # async_get_meters appends, so clear first; callers reload lazily.
+                self.meters = []
+                self._accounts_fetched_at = time.time()
                 # _LOGGER.info("Customer: %s", self.customers[0])
 
         except ClientResponseError as err:
