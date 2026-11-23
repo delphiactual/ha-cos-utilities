@@ -26,6 +26,7 @@ from homeassistant.core import HomeAssistant  # type: ignore
 from homeassistant.exceptions import ConfigEntryAuthFailed  # type: ignore
 from homeassistant.helpers import aiohttp_client  # type: ignore
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator  # type: ignore
+from homeassistant.helpers.update_coordinator import UpdateFailed  # type: ignore
 from homeassistant.util import dt as dt_util  # type: ignore
 
 from .const import CONF_ACCESS_TOKEN
@@ -39,6 +40,7 @@ from .csu import Meter
 from .csu import MeterType
 from .csu import ReadResolution
 from .csu import UsageRead
+from .exceptions import CannotConnect
 from .exceptions import InvalidAuth
 
 _LOGGER = logging.getLogger(__name__)
@@ -69,6 +71,9 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             token_expires_at=entry.data.get(CONF_TOKEN_EXPIRES_AT, 0.0),
             customer_id=entry.data.get(CONF_CUSTOMER_ID, ""),
         )
+        # The update listener compares against this so token saves (data only)
+        # don't trigger a reload.
+        self.options = dict(entry.options)
         self.entities = []
         self.data = {
             "monthly_totals": {
@@ -92,6 +97,8 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         except InvalidAuth as err:
             # Includes MfaRequired: a new one-time code needs the reauth flow.
             raise ConfigEntryAuthFailed from err
+        except CannotConnect as err:
+            raise UpdateFailed(f"Cannot reach CSU: {err}") from err
         self._save_token()
         # TODO: Usage Reads works great, but for useful sensors we need to take that data and get current bill usage.
         # If we poll last 12 months we can get 'typical' usage and cost.

@@ -258,33 +258,32 @@ class CSU:
                     "Content-Type": "application/json",
                 },
             ) as resp:
-                result = await resp.json()
-                if "errorMsg" in result or "account" not in result:
-                    # A rejected token comes back as a JSON error without errorMsg.
-                    raise InvalidAuth(
-                        result.get("errorMsg") or result.get("error") or "no account"
-                    )
-                # customerId = customerId
-                customerContext = result["account"][0]
-                # login() runs on every refresh; don't accumulate duplicate customers
-                self.customers = []
-                _LOGGER.info("Customer ID: %s", customerId)
-                # _LOGGER.info("Customer Context: %s", customerContext)
-                self.customers.append(
-                    CsuCustomer(
-                        customer_id=customerId, customer_context=customerContext
-                    )
-                )
-                # async_get_meters appends, so clear first; callers reload lazily.
-                self.meters = []
-                self._accounts_fetched_at = time.time()
-                # _LOGGER.info("Customer: %s", self.customers[0])
-
-        except ClientResponseError as err:
-            if err.status in (401, 403):
-                raise InvalidAuth(err) from err
-
+                status = resp.status
+                result = await resp.json(content_type=None)
+        except (aiohttp.ClientError, TimeoutError, ValueError) as err:
             raise CannotConnect(err) from err
+        if not isinstance(result, dict):
+            raise CannotConnect("Unexpected accounts response")
+        # Only a real rejection means the credentials need attention; anything
+        # else (outage, error page, odd payload) should just be retried later.
+        if (
+            status in (401, 403)
+            or result.get("error") == "invalid_token"
+            or "errorMsg" in result
+        ):
+            raise InvalidAuth(result.get("errorMsg") or result.get("error") or status)
+        if "account" not in result:
+            raise CannotConnect(f"Unexpected accounts response (HTTP {status})")
+        customerContext = result["account"][0]
+        # login() runs on every refresh; don't accumulate duplicate customers
+        self.customers = []
+        _LOGGER.info("Customer ID: %s", customerId)
+        self.customers.append(
+            CsuCustomer(customer_id=customerId, customer_context=customerContext)
+        )
+        # async_get_meters appends, so clear first; callers reload lazily.
+        self.meters = []
+        self._accounts_fetched_at = time.time()
 
     async def async_get_meters(self) -> None:
         """Get meters for the customer."""
