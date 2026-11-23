@@ -81,7 +81,7 @@ async def _usage_reads(self, meter, aggregate_type, start, end):
 
 
 @pytest.fixture
-def api(recorder_mock):
+def api():
     """Patch the CSU API methods; yield the login mock so tests can count calls."""
     with (
         patch.object(CSU, "async_login", autospec=True, side_effect=_login) as login,
@@ -112,7 +112,7 @@ async def _setup(hass, entry):
     await hass.async_block_till_done()
 
 
-async def test_setup_loads_entry_and_creates_sensors(hass, entry, api):
+async def test_setup_loads_entry_and_creates_sensors(recorder_mock, hass, entry, api):
     await _setup(hass, entry)
 
     assert entry.state is ConfigEntryState.LOADED
@@ -132,7 +132,7 @@ async def test_setup_loads_entry_and_creates_sensors(hass, entry, api):
             assert state.state not in ("unavailable", "unknown")
 
 
-async def test_token_save_does_not_reload_but_option_change_does(hass, entry, api):
+async def test_token_save_does_not_reload_but_option_change_does(recorder_mock, hass, entry, api):
     await _setup(hass, entry)
     first = entry.runtime_data
 
@@ -150,7 +150,7 @@ async def test_token_save_does_not_reload_but_option_change_does(hass, entry, ap
     assert entry.runtime_data is not first
 
 
-async def test_cannot_connect_retries_setup(hass, entry, api):
+async def test_cannot_connect_retries_setup(recorder_mock, hass, entry, api):
     api.side_effect = CannotConnect("fake outage")
 
     await _setup(hass, entry)
@@ -158,7 +158,7 @@ async def test_cannot_connect_retries_setup(hass, entry, api):
     assert entry.state is ConfigEntryState.SETUP_RETRY
 
 
-async def test_invalid_auth_starts_reauth(hass, entry, api):
+async def test_invalid_auth_starts_reauth(recorder_mock, hass, entry, api):
     api.side_effect = InvalidAuth("fake rejection")
 
     await _setup(hass, entry)
