@@ -423,7 +423,7 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
     async def _insert_series(self, meter, id_prefix, suffix, attr, label) -> None:
         statistic_id = f"{DOMAIN}:{id_prefix}_{suffix}"
         last_stat = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, statistic_id, True, set()
+            get_last_statistics, self.hass, 1, statistic_id, True, {"sum"}
         )
         if not last_stat:
             _LOGGER.info("Updating statistics for the first time: %s", statistic_id)

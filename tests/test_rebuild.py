@@ -398,7 +398,7 @@ async def test_walk_that_stops_early_is_logged_and_given_up_after_three_starts(
     older = fake.base - timedelta(days=10)
     points = [
         StatisticData(start=older + timedelta(days=n), state=1.0, sum=float(n + 1))
-        for n in range(3)
+        for n in range(50)  # carries on into the period the fake history covers
     ]
     metadata = CsuCoordinator._statistic_metadata(fake.elec, IMPORT_ID, "consumption")
     async_add_external_statistics(hass, metadata, points)
