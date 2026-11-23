@@ -1,4 +1,5 @@
 """Colorado Springs Utilities API."""
+
 import dataclasses
 import json
 import logging
@@ -345,7 +346,11 @@ class CSU:
             bucket[0] += imp
             bucket[1] += rec
         result = []
-        span = timedelta(days=1) if aggregate_type == AggregateType.DAY else timedelta(hours=1)
+        span = (
+            timedelta(days=1)
+            if aggregate_type == AggregateType.DAY
+            else timedelta(hours=1)
+        )
         for start in sorted(buckets):
             imp, rec = buckets[start]
             result.append(

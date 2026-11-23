@@ -1,5 +1,31 @@
 # HA Colorado Springs Utilities Integration
 
+> **Fork notice.** This is a maintained fork of [HartD92/ha-cos-utilities](https://github.com/HartD92/ha-cos-utilities) (unmaintained since 2024-07), targeting Home Assistant 2026.11+. Install it as a HACS custom repository: `https://github.com/delphiactual/ha-cos-utilities`.
+>
+> **Credits.** The net-metering, interval parsing and first-import fixes are [mattsm](https://github.com/mattsm)'s work (upstream PR #71). The local brand assets are [frenck](https://github.com/frenck)'s (upstream PR #72).
+
+## Long-term statistics (Energy dashboard)
+
+| Meter | Statistic ID | Unit |
+| ----- | ------------ | ---- |
+| Electric import | `csu:csu_elec_<customer id>_energy_consumption` | kWh |
+| Electric export (net metering) | `csu:csu_elec_<customer id>_energy_production` | kWh |
+| Gas | `csu:csu_gas_<customer id>_gas_consumption` | CCF |
+| Water | `csu:csu_water_<customer id>_water_consumption` | ft³ |
+
+Before 0.2.0 gas and water were stored as `..._energy_consumption`. On first run the integration renames those existing statistics in place, so history is kept. You will need to re-select the gas and water sources once in the Energy dashboard settings.
+
+Known limitation: reads are keyed on CSU's local-time labels, so the repeated hour at the autumn DST change may be merged.
+
+## Smoke test
+
+`scripts/smoke_test.py` logs in with `CSU_USERNAME` / `CSU_PASSWORD` from the environment and prints recent hourly import, export, gas and water usage so it can be checked against the CSU portal:
+
+```text
+pip install aiohttp arrow python-dateutil
+python scripts/smoke_test.py [days]
+```
+
 [![GitHub Release][releases-shield]][releases]
 [![GitHub Activity][commits-shield]][commits]
 [![License][license-shield]](LICENSE)

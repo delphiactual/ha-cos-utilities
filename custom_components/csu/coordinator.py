@@ -1,4 +1,5 @@
 """Coordinator for CSU data."""
+
 import logging
 from datetime import datetime
 from datetime import timedelta
@@ -8,14 +9,10 @@ from typing import cast
 
 from homeassistant.components.recorder import get_instance  # type: ignore
 from homeassistant.components.recorder.models import StatisticData  # type: ignore
+from homeassistant.components.recorder.models import StatisticMeanType  # type: ignore
 from homeassistant.components.recorder.models import StatisticMetaData  # type: ignore
 from homeassistant.util.unit_conversion import EnergyConverter  # type: ignore
 from homeassistant.util.unit_conversion import VolumeConverter  # type: ignore
-
-try:  # HA >= 2025.x replaced has_mean with mean_type and added unit_class
-    from homeassistant.components.recorder.models import StatisticMeanType  # type: ignore
-except ImportError:  # pragma: no cover - older Home Assistant
-    StatisticMeanType = None
 from homeassistant.components.recorder.statistics import async_add_external_statistics  # type: ignore
 from homeassistant.components.recorder.statistics import get_last_statistics  # type: ignore
 from homeassistant.components.recorder.statistics import statistics_during_period  # type: ignore
@@ -143,8 +140,9 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             self.data["monthly_totals"][meter.meter_type.name]["cost"] = total_cost
         # The first import walks ~3 years of history; never block HA startup on it.
         if not getattr(self, "_stats_task", None) or self._stats_task.done():
-            self._stats_task = self.hass.async_create_background_task(
-                self._insert_statistics(), "csu_insert_statistics"
+            # Tied to the config entry so unload/reload cancels an in-flight import.
+            self._stats_task = self.config_entry.async_create_background_task(
+                self.hass, self._insert_statistics(), "csu_insert_statistics"
             )
         return self.data
 
@@ -156,18 +154,46 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             id_prefix = (
                 f"csu_{meter.meter_type.name.lower()}_{meter.customer.customer_id}"
             )
-            series = [("energy_consumption", "consumption", "consumption")]
             if meter.meter_type == MeterType.ELEC:
-                series.append(("energy_production", "received", "returned to grid"))
+                series = [
+                    ("energy_consumption", "consumption", "consumption"),
+                    ("energy_production", "received", "returned to grid"),
+                ]
+            else:
+                # Gas and water are volumes, so "energy" in the id would be wrong.
+                kind = meter.meter_type.name.lower()
+                series = [(f"{kind}_consumption", "consumption", "consumption")]
+                await self._migrate_legacy_statistic_id(
+                    f"{DOMAIN}:{id_prefix}_energy_consumption",
+                    f"{DOMAIN}:{id_prefix}_{series[0][0]}",
+                )
             self._reads_cache = {}
             for suffix, attr, label in series:
                 await self._insert_series(meter, id_prefix, suffix, attr, label)
+
+    async def _migrate_legacy_statistic_id(self, old_id: str, new_id: str) -> None:
+        """Rename pre-0.2.0 gas/water statistics so their history is kept."""
+        recorder = get_instance(self.hass)
+        new_stat, old_stat = [
+            await recorder.async_add_executor_job(
+                get_last_statistics, self.hass, 1, sid, False, set()
+            )
+            for sid in (new_id, old_id)
+        ]
+        if new_stat or not old_stat:
+            return
+        _LOGGER.info("Renaming statistic %s to %s", old_id, new_id)
+        recorder.async_update_statistics_metadata(old_id, new_statistic_id=new_id)
+        # The rename is queued; wait so the lookups below see the new id.
+        await recorder.async_block_till_done()
 
     async def _cached_reads(self, meter, start_time):
         cache = getattr(self, "_reads_cache", {})
         # None (full history) satisfies any later-start request for the same meter
         for (sid, st), reads in cache.items():
-            if sid == meter.service_id and (st is None or (start_time is not None and st <= start_time)):
+            if sid == meter.service_id and (
+                st is None or (start_time is not None and st <= start_time)
+            ):
                 return reads
         reads = await self._async_get_usage_reads(meter, TIME_ZONE, start_time)
         cache[(meter.service_id, start_time)] = reads
@@ -185,7 +211,9 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             running_sum = 0.0
             last_stats_time = None
         else:
-            usage_reads = await self._cached_reads(meter, last_stat[statistic_id][0]["start"])
+            usage_reads = await self._cached_reads(
+                meter, last_stat[statistic_id][0]["start"]
+            )
             if not usage_reads:
                 return
             stats = await get_instance(self.hass).async_add_executor_job(
@@ -218,21 +246,21 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             MeterType.WATER: UnitOfVolume.CUBIC_FEET,
         }[meter.meter_type]
         metadata = StatisticMetaData(
+            mean_type=StatisticMeanType.NONE,
             has_sum=True,
-            name=f"CSU {meter.meter_type.name.lower()} {label}",
+            unit_class=(
+                EnergyConverter.UNIT_CLASS
+                if meter.meter_type == MeterType.ELEC
+                else VolumeConverter.UNIT_CLASS
+            ),
+            name=(
+                f"CSU {meter.meter_type.name.lower()} "
+                f"{meter.customer.customer_id} {label}"
+            ),
             source=DOMAIN,
             statistic_id=statistic_id,
             unit_of_measurement=unit,
         )
-        if StatisticMeanType is not None:
-            metadata["mean_type"] = StatisticMeanType.NONE
-            metadata["unit_class"] = (
-                EnergyConverter.UNIT_CLASS
-                if meter.meter_type == MeterType.ELEC
-                else VolumeConverter.UNIT_CLASS
-            )
-        else:
-            metadata["has_mean"] = False
         if not valid_statistic_id(statistic_id):
             _LOGGER.warning("Invalid statistic id: %s", statistic_id)
             return

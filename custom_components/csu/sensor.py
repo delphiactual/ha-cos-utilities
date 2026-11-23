@@ -24,7 +24,6 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
         await coordinator.api.async_login()
     if not coordinator.api.meters:
         await coordinator.api.async_get_meters()
-    #
     async_add_entities(
         CSUSensor(coordinator, meter.meter_type) for meter in coordinator.api.meters
     )
