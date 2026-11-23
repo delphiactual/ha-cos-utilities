@@ -11,7 +11,7 @@
 | Electric import | `csu:csu_elec_<customer id>_energy_consumption` | kWh |
 | Electric export (net metering) | `csu:csu_elec_<customer id>_energy_production` | kWh |
 | Gas | `csu:csu_gas_<customer id>_gas_consumption` | CCF |
-| Water | `csu:csu_water_<customer id>_water_consumption` | ft³ |
+| Water | `csu:csu_water_<customer id>_water_consumption` | ftÂ³ |
 
 Before 0.2.0 gas and water were stored as `..._energy_consumption`. On first run the integration renames those existing statistics in place, so history is kept. You will need to re-select the gas and water sources once in the Energy dashboard settings.
 
