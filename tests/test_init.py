@@ -112,7 +112,9 @@ async def _setup(hass, entry):
     await hass.async_block_till_done()
 
 
-async def test_setup_loads_entry_and_creates_sensors(recorder_mock, hass, entry, api):
+async def test_setup_loads_entry_and_creates_sensors(
+    recorder_mock, enable_custom_integrations, hass, entry, api
+):
     await _setup(hass, entry)
 
     assert entry.state is ConfigEntryState.LOADED
@@ -132,7 +134,9 @@ async def test_setup_loads_entry_and_creates_sensors(recorder_mock, hass, entry,
             assert state.state not in ("unavailable", "unknown")
 
 
-async def test_token_save_does_not_reload_but_option_change_does(recorder_mock, hass, entry, api):
+async def test_token_save_does_not_reload_but_option_change_does(
+    recorder_mock, enable_custom_integrations, hass, entry, api
+):
     await _setup(hass, entry)
     first = entry.runtime_data
 
@@ -144,13 +148,17 @@ async def test_token_save_does_not_reload_but_option_change_does(recorder_mock, 
     assert entry.state is ConfigEntryState.LOADED
     assert entry.runtime_data is first
 
-    hass.config_entries.async_update_entry(entry, options={"electric_rate_per_kwh": 0.1})
+    hass.config_entries.async_update_entry(
+        entry, options={"electric_rate_per_kwh": 0.1}
+    )
     await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.LOADED
     assert entry.runtime_data is not first
 
 
-async def test_cannot_connect_retries_setup(recorder_mock, hass, entry, api):
+async def test_cannot_connect_retries_setup(
+    recorder_mock, enable_custom_integrations, hass, entry, api
+):
     api.side_effect = CannotConnect("fake outage")
 
     await _setup(hass, entry)
@@ -158,7 +166,9 @@ async def test_cannot_connect_retries_setup(recorder_mock, hass, entry, api):
     assert entry.state is ConfigEntryState.SETUP_RETRY
 
 
-async def test_invalid_auth_starts_reauth(recorder_mock, hass, entry, api):
+async def test_invalid_auth_starts_reauth(
+    recorder_mock, enable_custom_integrations, hass, entry, api
+):
     api.side_effect = InvalidAuth("fake rejection")
 
     await _setup(hass, entry)
