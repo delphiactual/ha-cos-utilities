@@ -353,3 +353,5 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         return usage_reads
 
         # add in additional update for quarter-hour reads?
+
+type CsuConfigEntry = ConfigEntry[CsuCoordinator]

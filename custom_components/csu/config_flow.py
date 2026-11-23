@@ -10,7 +10,6 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry  # type: ignore
 from homeassistant.config_entries import ConfigFlow  # type: ignore
 from homeassistant.config_entries import ConfigFlowResult  # type: ignore
-from homeassistant.config_entries import CONN_CLASS_CLOUD_POLL  # type: ignore
 from homeassistant.config_entries import OptionsFlow  # type: ignore
 from homeassistant.config_entries import SOURCE_REAUTH  # type: ignore
 from homeassistant.const import CONF_PASSWORD  # type: ignore
@@ -78,7 +77,6 @@ class CSUConfigFlow(ConfigFlow, domain=DOMAIN):
     """Config Flow for setting up CSU."""
 
     VERSION = 1
-    CONNECTION_CLASS = CONN_CLASS_CLOUD_POLL
 
     def __init__(self) -> None:
         """Initialize a new CSUConfigFlow."""

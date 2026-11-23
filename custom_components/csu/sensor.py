@@ -1,4 +1,5 @@
 """Platform for sensor integration."""
+
 import logging
 
 from homeassistant.components.sensor import SensorDeviceClass
@@ -8,7 +9,7 @@ from homeassistant.const import UnitOfVolume
 from homeassistant.core import HomeAssistant  # type: ignore
 from homeassistant.helpers.typing import StateType  # type: ignore
 
-from .coordinator import CsuCoordinator
+from .coordinator import CsuConfigEntry
 from .csu import MeterType
 from .entity import CSUEntity
 
@@ -17,19 +18,16 @@ from .entity import CSUEntity
 _LOGGER = logging.getLogger(__name__)
 
 
-async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities):
+async def async_setup_entry(
+    hass: HomeAssistant, config_entry: CsuConfigEntry, async_add_entities
+):
     """Add sensors for passed config_entry in HA."""
-    coordinator = CsuCoordinator(hass, config_entry.data)
-    if not coordinator.api.customers:
-        await coordinator.api.async_login()
-    if not coordinator.api.meters:
-        await coordinator.api.async_get_meters()
+    # The first refresh in async_setup_entry already logged in and loaded the meters.
+    coordinator = config_entry.runtime_data
+    meter_types = [meter.meter_type for meter in coordinator.api.meters]
     async_add_entities(
-        CSUSensor(coordinator, meter.meter_type) for meter in coordinator.api.meters
-    )
-
-    async_add_entities(
-        CSUCostSensor(coordinator, meter.meter_type) for meter in coordinator.api.meters
+        [CSUSensor(coordinator, mt) for mt in meter_types]
+        + [CSUCostSensor(coordinator, mt) for mt in meter_types]
     )
 
 

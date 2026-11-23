@@ -8,11 +8,11 @@ from datetime import datetime
 from datetime import timedelta
 from enum import Enum
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import arrow
 from aiohttp.client_exceptions import ClientResponseError
-from dateutil import tz
 
 from .const import TIME_ZONE
 from .const import USER_AGENT
@@ -23,6 +23,9 @@ from .exceptions import MfaRequired
 TOKEN_URL = "https://myaccount.csu.org/rest/oauth/token"
 # Accounts and services rarely change, and usage data lags by a day or more.
 ACCOUNT_REFRESH_SECONDS = 24 * 60 * 60
+# Built once at import: constructing it per call reads tzdata from disk, which
+# blocks the event loop when called from async code.
+LOCAL_TZ = ZoneInfo(TIME_ZONE)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -412,7 +415,7 @@ class CSU:
         # null for export-only (net-metered) intervals, which broke hourly bucketing and dropped
         # export entirely. Interval labels are interval END times; daily labels are the day.
         # Missing reads (no import and no received value) are skipped, never date-shifted.
-        DEN = tz.gettz(TIME_ZONE)
+        DEN = LOCAL_TZ
         seen: dict[str, dict] = {}
         for read in reads:
             label = read.get("usageDate")

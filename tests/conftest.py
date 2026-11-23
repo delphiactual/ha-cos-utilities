@@ -101,3 +101,9 @@ def make_api(mod, session, *, token="", expires_in=0):
         token_expires_at=time.time() + expires_in,
         customer_id=CUSTOMER_ID if token else "",
     )
+
+
+@pytest.fixture(autouse=True)
+def auto_enable_custom_integrations(enable_custom_integrations):
+    """Let Home Assistant load custom_components/csu in tests."""
+    yield
