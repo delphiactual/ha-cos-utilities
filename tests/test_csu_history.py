@@ -149,13 +149,83 @@ def _hours_of(reads, day):
 
 def test_reconcile_fills_a_day_with_no_interval_data(mod, meter):
     day = _day(mod, 2026, 5, 10)
+    before = _day(mod, 2026, 5, 9)
+    # Another day shows that export only happens in hours 9 to 15.
+    real = [
+        _read(
+            mod,
+            meter,
+            before + timedelta(hours=h),
+            imp=1.0,
+            exp=0.5 if 9 <= h <= 15 else 0.0,
+        )
+        for h in range(24)
+    ]
+    daily = [
+        _read(mod, meter, before, imp=24.0, exp=3.5, hours=24),
+        _read(mod, meter, day, imp=24.0, exp=2.4, hours=24),
+    ]
+
+    out = mod.csu.reconcile_hourly_with_daily(real, daily)
+
+    filled = _hours_of(out, day)
+    assert len(filled) == 24
+    assert sum(r.consumption for r in filled) == pytest.approx(24.0)
+    assert sum(r.received for r in filled) == pytest.approx(2.4)
+    # Export lands only in the solar hours, never overnight.
+    assert {r.start_time.hour for r in filled if r.received > 0} == set(range(9, 16))
+
+
+def test_reconcile_skips_export_when_none_was_ever_seen(mod, meter):
+    day = _day(mod, 2026, 5, 10)
     daily = [_read(mod, meter, day, imp=24.0, exp=2.4, hours=24)]
 
     out = mod.csu.reconcile_hourly_with_daily([], daily)
 
-    assert len(out) == 24
     assert sum(r.consumption for r in out) == pytest.approx(24.0)
-    assert sum(r.received for r in out) == pytest.approx(2.4)
+    assert sum(r.received for r in out) == 0.0
+
+
+def test_reconcile_partial_export_day_fills_only_the_missing_hours(mod, meter):
+    day = _day(mod, 2026, 5, 10)
+    # Hours 12 and 13 have no read. Every other hour has one, including real
+    # zero export at night and in the evening.
+    present = [h for h in range(24) if h not in (12, 13)]
+    real = [
+        _read(
+            mod,
+            meter,
+            day + timedelta(hours=h),
+            imp=1.0,
+            exp=0.5 if 8 <= h <= 17 else 0.0,
+        )
+        for h in present
+    ]
+    daily = [_read(mod, meter, day, imp=22.0, exp=5.0 * 1.0 + 1.0, hours=24)]
+
+    out = mod.csu.reconcile_hourly_with_daily(real, daily)
+
+    by_hour = {r.start_time.hour: r for r in out}
+    # 8 present solar hours hold 4.0; the daily total is 6.0, so 2.0 is missing.
+    assert by_hour[12].received == pytest.approx(1.0)
+    assert by_hour[13].received == pytest.approx(1.0)
+    for hour in present:
+        assert by_hour[hour].received == (0.5 if 8 <= hour <= 17 else 0.0)
+    assert sum(r.received for r in out) == pytest.approx(6.0)
+
+
+def test_reconcile_never_fills_a_present_hour_even_when_its_value_is_zero(mod, meter):
+    day = _day(mod, 2026, 5, 10)
+    real = [
+        _read(mod, meter, day + timedelta(hours=h), imp=0.0 if h == 3 else 1.0)
+        for h in range(24)
+    ]
+    daily = [_read(mod, meter, day, imp=30.0, hours=24)]
+
+    out = mod.csu.reconcile_hourly_with_daily(real, daily)
+
+    # No hour is missing, so the shortfall has nowhere truthful to go.
+    assert [r.consumption for r in out] == [0.0 if h == 3 else 1.0 for h in range(24)]
 
 
 def test_reconcile_only_adds_to_hours_without_data(mod, meter):

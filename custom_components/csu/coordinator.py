@@ -33,6 +33,7 @@ from homeassistant.util import dt as dt_util  # type: ignore
 from .const import CONF_ACCESS_TOKEN
 from .const import CONF_CUSTOMER_ID
 from .const import CONF_HOURLY_REBUILD_DONE
+from .const import CONF_HOURLY_REBUILD_REFUSED
 from .const import CONF_TOKEN_EXPIRES_AT
 from .const import DOMAIN
 from .const import TIME_ZONE
@@ -58,6 +59,8 @@ HOURLY_MAX_HISTORY = timedelta(days=3650)
 # One token must outlast the whole rebuild, because the server has no refresh
 # and a new login could ask for an MFA code.
 REBUILD_TOKEN_MARGIN = 40 * 60
+# A series whose history can never be rebuilt safely stops being retried.
+REBUILD_MAX_REFUSALS = 3
 
 
 class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
@@ -222,11 +225,17 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
     def _pending_rebuild(self, id_prefix, series) -> dict:
         """Series not yet rebuilt and not already tried since this start."""
         done = set(self.config_entry.data.get(CONF_HOURLY_REBUILD_DONE, []))
+        refused = self.config_entry.data.get(CONF_HOURLY_REBUILD_REFUSED, {})
         pending = {}
         for suffix, attr, label in series:
             sid = f"{DOMAIN}:{id_prefix}_{suffix}"
-            if sid not in done and sid not in self._rebuild_attempted:
-                pending[sid] = (attr, label)
+            if sid in done or sid in self._rebuild_attempted:
+                continue
+            if refused.get(sid, 0) >= REBUILD_MAX_REFUSALS:
+                _LOGGER.info("Not retrying the history rebuild of %s", sid)
+                self._rebuild_attempted.add(sid)  # say so once per start
+                continue
+            pending[sid] = (attr, label)
         return pending
 
     def _can_rebuild_hourly(self, meter, id_prefix, series) -> bool:
@@ -242,6 +251,8 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             # Never start a reauth from a background backfill; try next start.
             _LOGGER.warning("Skipping the history rebuild for now: %s", err)
             return False
+        # A restart before the next poll should reuse this token, not log in again.
+        self._save_token()
         return True
 
     async def _async_rebuild_hourly(self, meter, id_prefix, series) -> None:
@@ -278,15 +289,20 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             return
         if not reads:
             _LOGGER.warning("No hourly history returned for %s", meter.meter_type.name)
+            for statistic_id in pending:
+                self._count_refusal(statistic_id)
             return
-        # Interval data has holes that the daily totals still cover.
-        reads = reconcile_hourly_with_daily(reads, daily)
+        # Electric interval data has holes that the daily totals still cover. Gas
+        # hours without a read are real "no usage" hours, so gas is used as is.
+        if meter.meter_type == MeterType.ELEC:
+            reads = reconcile_hourly_with_daily(reads, daily)
         for statistic_id, (attr, label) in pending.items():
             if not valid_statistic_id(statistic_id):
                 _LOGGER.warning("Invalid statistic id: %s", statistic_id)
                 continue
             points = self._hourly_points(reads, attr)
             if not await self._rebuild_is_safe(statistic_id, points):
+                self._count_refusal(statistic_id)
                 continue
             metadata = self._statistic_metadata(meter, statistic_id, label)
             _LOGGER.info(
@@ -339,11 +355,30 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         if before.get(statistic_id) or (
             newest_start is not None and newest_start > last.timestamp()
         ):
+            oldest = (
+                before[statistic_id][0]["start"] if before.get(statistic_id) else None
+            )
             _LOGGER.warning(
-                "Not rebuilding %s: it has rows outside the new history", statistic_id
+                "Not rebuilding %s: the history walk covered %s to %s, but existing "
+                "rows reach outside that (oldest row before it: %s)",
+                statistic_id,
+                first.date(),
+                last.date(),
+                datetime.fromtimestamp(oldest, tz=timezone.utc).date()
+                if oldest is not None
+                else "none",
             )
             return False
         return True
+
+    def _count_refusal(self, statistic_id: str) -> None:
+        """Remember a refusal so a series that can never rebuild stops retrying."""
+        refused = dict(self.config_entry.data.get(CONF_HOURLY_REBUILD_REFUSED, {}))
+        refused[statistic_id] = refused.get(statistic_id, 0) + 1
+        self.hass.config_entries.async_update_entry(
+            self.config_entry,
+            data={**self.config_entry.data, CONF_HOURLY_REBUILD_REFUSED: refused},
+        )
 
     def _mark_rebuilt(self, statistic_id: str) -> None:
         done = list(self.config_entry.data.get(CONF_HOURLY_REBUILD_DONE, []))
@@ -515,10 +550,11 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             meter, AggregateType.HOUR, start, end
         )
         # Only days inside the hourly window; older days stay daily.
-        hourly_usage_reads = reconcile_hourly_with_daily(
-            hourly_usage_reads,
-            [r for r in usage_reads if r.start_time.date() >= start.date()],
-        )
+        if meter.meter_type == MeterType.ELEC:
+            hourly_usage_reads = reconcile_hourly_with_daily(
+                hourly_usage_reads,
+                [r for r in usage_reads if r.start_time.date() >= start.date()],
+            )
         _update_with_finer_usage_reads(usage_reads, hourly_usage_reads)
         return usage_reads
 

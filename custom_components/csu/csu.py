@@ -135,13 +135,21 @@ def reconcile_hourly_with_daily(
 
     CSU's interval data has holes (null reads, sometimes whole days) on days its
     daily totals still cover, so summing hourly reads can fall well short. Each
-    day's shortfall is spread over that day's hours without data, which keeps the
-    daily totals and the real hourly shape. Days with no daily read are untouched.
+    day's shortfall is spread over that day's hours that have no read at all, which
+    keeps the daily totals and the real hourly shape. An hour that has a read is
+    real even when its value is zero (no export at night), so it is never filled.
+    Days with no daily read are untouched.
     """
     hours: dict[datetime, list] = {}  # UTC hour -> [import, export, tzinfo]
     for read in hourly:
         key = read.start_time.astimezone(timezone.utc)
         hours[key] = [read.consumption, read.received, read.start_time.tzinfo]
+    # Judge gaps against the original reads, not hours added while filling.
+    read_hours = set(hours)
+    # Export only happens when the sun is up, so a missing hour can only hold
+    # export between the first and last hour of the day where export was seen.
+    seen_export = [r.start_time.hour for r in hourly if r.received > 0]
+    export_window = range(min(seen_export), max(seen_export) + 1) if seen_export else ()
     meter = hourly[0].meter if hourly else (daily[0].meter if daily else None)
     for day_read in daily:
         tz = day_read.start_time.tzinfo
@@ -157,8 +165,11 @@ def reconcile_hourly_with_daily(
             shortfall = getattr(day_read, attr) - total
             if shortfall <= 0.001:
                 continue
-            gaps = [h for h in day_hours if h not in hours or hours[h][index] <= 0]
-            gaps = gaps or day_hours
+            gaps = [h for h in day_hours if h not in read_hours]
+            if attr == "received":
+                gaps = [h for h in gaps if h.astimezone(tz).hour in export_window]
+            if not gaps:
+                continue
             for hour in gaps:
                 entry = hours.setdefault(hour, [0.0, 0.0, tz])
                 entry[index] += shortfall / len(gaps)
