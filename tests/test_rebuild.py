@@ -57,17 +57,20 @@ def _meter(number, meter_type, resolution):
     )
 
 
-def _value(attr, i):
-    """Hours with i % 13 == 5 have no read at all, like many gas hours."""
-    if i % 13 == 5:
-        return 0.0
+def _truth(attr, i):
+    """What was really used in hour i; the daily totals include all of it."""
     if attr == "consumption":
         return ((i * 7) % 11) / 4 + 0.1
     return ((i * 5) % 7) / 10
 
 
+def _has_read(i):
+    """CSU's interval data has holes: some hours, and all of day 3, are null."""
+    return i % 13 != 5 and i // 24 != 3
+
+
 class FakeCsu:
-    """Fake CSU history: 40 days of hourly electric reads ending at midnight UTC."""
+    """Fake CSU history: 40 days of electric ending at midnight UTC."""
 
     def __init__(self):
         today = dt_util.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -83,7 +86,7 @@ class FakeCsu:
     def hourly(self):
         reads = []
         for i in range(self.hours):
-            if i % 13 == 5:
+            if not _has_read(i):
                 continue
             start = self.base + i * HOUR
             reads.append(
@@ -91,38 +94,27 @@ class FakeCsu:
                     meter=self.elec,
                     start_time=start,
                     end_time=start + HOUR,
-                    consumption=_value("consumption", i),
-                    received=_value("received", i),
+                    consumption=_truth("consumption", i),
+                    received=_truth("received", i),
                 )
             )
         return reads
 
     def daily(self):
-        days = {}
-        for read in self.hourly():
-            day = read.start_time.replace(hour=0)
-            total = days.setdefault(day, [0.0, 0.0])
-            total[0] += read.consumption
-            total[1] += read.received
-        return [
-            UsageRead(
-                meter=self.elec,
-                start_time=day,
-                end_time=day + timedelta(days=1),
-                consumption=imp,
-                received=exp,
+        reads = []
+        for day in range(self.hours // 24):
+            start = self.base + timedelta(days=day)
+            hours = range(day * 24, day * 24 + 24)
+            reads.append(
+                UsageRead(
+                    meter=self.elec,
+                    start_time=start,
+                    end_time=start + timedelta(days=1),
+                    consumption=sum(_truth("consumption", i) for i in hours),
+                    received=sum(_truth("received", i) for i in hours),
+                )
             )
-            for day, (imp, exp) in sorted(days.items())
-        ]
-
-    def expected(self, attr):
-        """(values, sums) per hour from the first hour, missing hours as zero."""
-        values = [_value(attr, i) for i in range(self.hours)]
-        sums, running = [], 0.0
-        for value in values:
-            running += value
-            sums.append(running)
-        return values, sums
+        return reads
 
     def usage_reads(self, api, meter, aggregate_type, start, end, **kwargs):
         if meter.meter_type == MeterType.WATER:
@@ -130,18 +122,20 @@ class FakeCsu:
                 self.water_hour_calls += 1
             else:
                 self.water_day_spans.append(end - start)
-            day = self.base
             return [
                 UsageRead(
                     meter=meter,
-                    start_time=day + timedelta(days=n),
-                    end_time=day + timedelta(days=n + 1),
+                    start_time=self.base + timedelta(days=n),
+                    end_time=self.base + timedelta(days=n + 1),
                     consumption=1.0,
                     received=0.0,
                 )
                 for n in range(10)
             ]
         if kwargs.get("strict"):
+            # A full-history fetch ignores the range, like the real walk does.
+            if aggregate_type == AggregateType.DAY:
+                return self.daily()
             self.deep_calls += 1
             if self.fail_deep:
                 raise CannotConnect("fake outage")
@@ -237,6 +231,29 @@ async def _setup(hass, entry):
     return coordinator
 
 
+def _by_hour(fake, rows):
+    return {round((r["start"] - fake.base.timestamp()) / 3600): r for r in rows}
+
+
+def _check_history(fake, rows, attr):
+    """Every hour has a row, the chain adds up, and days match the daily totals."""
+    by_hour = _by_hour(fake, rows)
+    assert sorted(by_hour) == list(range(fake.hours))
+    running = 0.0
+    for i in range(fake.hours):
+        running += by_hour[i]["state"]
+        assert by_hour[i]["sum"] == pytest.approx(running)
+    for day, daily in enumerate(fake.daily()):
+        total = sum(by_hour[i]["state"] for i in range(day * 24, day * 24 + 24))
+        assert total == pytest.approx(getattr(daily, attr)), f"day {day}"
+    if attr == "consumption":
+        # Real reads are kept as they are; only the holes are filled.
+        for i in range(fake.hours):
+            if _has_read(i):
+                assert by_hour[i]["state"] == pytest.approx(_truth(attr, i))
+    return by_hour
+
+
 async def test_rebuild_replaces_daily_rows_and_live_updates_continue(
     recorder_mock, enable_custom_integrations, hass, entry, fake, patched_api
 ):
@@ -246,34 +263,24 @@ async def test_rebuild_replaces_daily_rows_and_live_updates_continue(
 
     assert entry.state is ConfigEntryState.LOADED
     assert set(entry.data[CONF_HOURLY_REBUILD_DONE]) == {IMPORT_ID, EXPORT_ID}
+    rebuilt = {}
     for statistic_id, (attr, _) in SERIES.items():
-        values, sums = fake.expected(attr)
-        rows = await _rows(hass, statistic_id)
-        # Every hour has a row (missing reads as zero), so no old daily row survives.
-        assert len(rows) == fake.hours
-        assert rows[0]["start"] == fake.base.timestamp()
-        assert [r["state"] for r in rows] == pytest.approx(values)
-        assert [r["sum"] for r in rows] == pytest.approx(sums)
+        rebuilt[statistic_id] = _check_history(
+            fake, await _rows(hass, statistic_id), attr
+        )
 
-    # A later poll adds a day of reads; sums must carry on from the rebuilt chain.
+    # A later poll adds a day of reads; history must not move and the sums must
+    # carry on from the rebuilt chain without a jump.
+    before_hours = fake.hours
     fake.hours += 24
     await coordinator._insert_statistics()
     await get_instance(hass).async_block_till_done()
 
     assert fake.deep_calls == 1  # not rebuilt again
     for statistic_id, (attr, _) in SERIES.items():
-        values, sums = fake.expected(attr)
-        rows = await _rows(hass, statistic_id)
-        # Live updates only add rows for hours that have a read, so look rows up
-        # by hour. Every row, old and new, must sit on the same running total.
-        by_hour = {
-            round((r["start"] - fake.base.timestamp()) / 3600): r["sum"] for r in rows
-        }
-        assert len(rows) >= fake.hours - 2
-        assert max(by_hour) == fake.hours - 1
-        assert [by_hour[i] for i in sorted(by_hour)] == pytest.approx(
-            [sums[i] for i in sorted(by_hour)]
-        )
+        by_hour = _check_history(fake, await _rows(hass, statistic_id), attr)
+        for i in range(before_hours):
+            assert by_hour[i]["sum"] == pytest.approx(rebuilt[statistic_id][i]["sum"])
 
 
 async def test_failed_rebuild_changes_nothing_and_does_not_reauth(

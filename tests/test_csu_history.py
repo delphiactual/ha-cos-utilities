@@ -2,6 +2,8 @@
 
 import time
 from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 
 import aiohttp
 import pytest
@@ -125,3 +127,83 @@ async def test_ensure_token_only_renews_when_it_would_expire_too_soon(mod, sessi
     assert await api.async_ensure_token(1800) is True
     assert api.access_token == NEW_TOKEN
     assert api.token_expires_at > time.time() + 3000
+
+
+def _read(mod, meter, start, imp=0.0, exp=0.0, hours=1):
+    return mod.csu.UsageRead(
+        meter=meter,
+        start_time=start,
+        end_time=start + timedelta(hours=hours),
+        consumption=imp,
+        received=exp,
+    )
+
+
+def _day(mod, y, m, d):
+    return datetime(y, m, d, tzinfo=mod.csu.LOCAL_TZ)
+
+
+def _hours_of(reads, day):
+    return [r for r in reads if r.start_time.date() == day.date()]
+
+
+def test_reconcile_fills_a_day_with_no_interval_data(mod, meter):
+    day = _day(mod, 2026, 5, 10)
+    daily = [_read(mod, meter, day, imp=24.0, exp=2.4, hours=24)]
+
+    out = mod.csu.reconcile_hourly_with_daily([], daily)
+
+    assert len(out) == 24
+    assert sum(r.consumption for r in out) == pytest.approx(24.0)
+    assert sum(r.received for r in out) == pytest.approx(2.4)
+
+
+def test_reconcile_only_adds_to_hours_without_data(mod, meter):
+    day = _day(mod, 2026, 5, 10)
+    real = [_read(mod, meter, day + timedelta(hours=h), imp=1.0) for h in range(10)]
+    daily = [_read(mod, meter, day, imp=24.0, hours=24)]
+
+    out = mod.csu.reconcile_hourly_with_daily(real, daily)
+
+    assert sum(r.consumption for r in out) == pytest.approx(24.0)
+    assert len(out) == 24
+    assert [r.consumption for r in out[:10]] == [1.0] * 10  # real reads untouched
+    assert [r.consumption for r in out[10:]] == pytest.approx([14 / 14] * 14)
+
+
+def test_reconcile_leaves_complete_days_and_days_without_a_daily_alone(mod, meter):
+    day = _day(mod, 2026, 5, 10)
+    other = _day(mod, 2026, 5, 11)
+    real = [_read(mod, meter, day + timedelta(hours=h), imp=1.0) for h in range(24)]
+    real += [_read(mod, meter, other + timedelta(hours=1), imp=3.0)]
+    daily = [_read(mod, meter, day, imp=24.0, hours=24)]  # no daily for `other`
+
+    out = mod.csu.reconcile_hourly_with_daily(real, daily)
+
+    assert [(r.start_time, r.consumption) for r in out] == [
+        (r.start_time, r.consumption) for r in real
+    ]
+
+
+def test_reconcile_never_removes_when_hourly_exceeds_daily(mod, meter):
+    day = _day(mod, 2026, 5, 10)
+    real = [_read(mod, meter, day + timedelta(hours=h), imp=2.0) for h in range(24)]
+    daily = [_read(mod, meter, day, imp=40.0, hours=24)]
+
+    out = mod.csu.reconcile_hourly_with_daily(real, daily)
+
+    assert sum(r.consumption for r in out) == pytest.approx(48.0)
+
+
+@pytest.mark.parametrize(
+    "day, hours", [((2026, 3, 8), 23), ((2026, 11, 1), 25), ((2026, 6, 1), 24)]
+)
+def test_reconcile_handles_dst_days(mod, meter, day, hours):
+    start = _day(mod, *day)
+    daily = [_read(mod, meter, start, imp=float(hours), hours=hours)]
+
+    out = mod.csu.reconcile_hourly_with_daily([], daily)
+
+    assert len(out) == hours
+    assert len({r.start_time.astimezone(timezone.utc) for r in out}) == hours
+    assert sum(r.consumption for r in out) == pytest.approx(float(hours))

@@ -29,6 +29,8 @@ CSU keeps different amounts of history per resolution (checked against a live ac
 
 Electric (import and export) and gas are imported hourly for their whole history. Water has no hourly data, so it is imported daily for the last 2 years.
 
+CSU's hourly electric data has holes: on the account that was checked, about 150 of the last 730 days had no interval data at all, even though the daily totals were present. Summing the raw hourly data would have been about 22% below the portal. So for every day that has a daily total (the last 2 years), the difference between the daily total and the hourly data is spread over that day's hours that have no data. Real hourly reads are never changed, and daily totals match the portal. Days older than 2 years have no daily total to compare against, so they are used as CSU reports them.
+
 Upgrading from 0.2.x to 0.3.0 does a one-time rebuild of the electric and gas statistics in the background after startup. Each series is fetched in full, its sums are recomputed from zero and it is written in a single step, replacing the old one-row-per-day entries for older periods. Because of that, older periods in the Energy dashboard will change. If anything fails (an outage, an expired login), nothing is written and the rebuild is retried the next time Home Assistant starts. It never asks you to sign in again.
 
 ## Smoke test

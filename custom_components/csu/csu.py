@@ -7,6 +7,7 @@ import logging
 import time
 from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 from enum import Enum
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -125,6 +126,52 @@ class CostRead:
     end_time: datetime
     consumption: float  # taken from value field, in KWH or CCF
     provided_cost: float  # in $
+
+
+def reconcile_hourly_with_daily(
+    hourly: list[UsageRead], daily: list[UsageRead]
+) -> list[UsageRead]:
+    """Make hourly reads add up to the daily totals, which are what the portal shows.
+
+    CSU's interval data has holes (null reads, sometimes whole days) on days its
+    daily totals still cover, so summing hourly reads can fall well short. Each
+    day's shortfall is spread over that day's hours without data, which keeps the
+    daily totals and the real hourly shape. Days with no daily read are untouched.
+    """
+    hours: dict[datetime, list] = {}  # UTC hour -> [import, export, tzinfo]
+    for read in hourly:
+        key = read.start_time.astimezone(timezone.utc)
+        hours[key] = [read.consumption, read.received, read.start_time.tzinfo]
+    meter = hourly[0].meter if hourly else (daily[0].meter if daily else None)
+    for day_read in daily:
+        tz = day_read.start_time.tzinfo
+        day = day_read.start_time.date()
+        # Step in UTC so the 23 and 25 hour DST days come out right.
+        day_hours = []
+        current = day_read.start_time.astimezone(timezone.utc)
+        while current.astimezone(tz).date() == day:
+            day_hours.append(current)
+            current += timedelta(hours=1)
+        for index, attr in enumerate(("consumption", "received")):
+            total = sum(hours[h][index] for h in day_hours if h in hours)
+            shortfall = getattr(day_read, attr) - total
+            if shortfall <= 0.001:
+                continue
+            gaps = [h for h in day_hours if h not in hours or hours[h][index] <= 0]
+            gaps = gaps or day_hours
+            for hour in gaps:
+                entry = hours.setdefault(hour, [0.0, 0.0, tz])
+                entry[index] += shortfall / len(gaps)
+    return [
+        UsageRead(
+            meter=meter,
+            start_time=hour.astimezone(tz),
+            end_time=hour.astimezone(tz) + timedelta(hours=1),
+            consumption=round(imp, 4),
+            received=round(exp, 4),
+        )
+        for hour, (imp, exp, tz) in sorted(hours.items())
+    ]
 
 
 class CSU:

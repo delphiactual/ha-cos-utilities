@@ -41,6 +41,7 @@ from .csu import CSU
 from .csu import Meter
 from .csu import MeterType
 from .csu import ReadResolution
+from .csu import reconcile_hourly_with_daily
 from .csu import SUPPORTED_AGGREGATE_TYPES
 from .csu import UsageRead
 from .exceptions import CannotConnect
@@ -264,6 +265,9 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
                 window_days=HOURLY_WINDOW_DAYS,
                 strict=True,
             )
+            daily = await self.api.async_get_usage_reads(
+                meter, AggregateType.DAY, end - DAILY_HISTORY, end, strict=True
+            )
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning(
                 "Hourly history for %s could not be fetched, will retry on the "
@@ -275,6 +279,8 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         if not reads:
             _LOGGER.warning("No hourly history returned for %s", meter.meter_type.name)
             return
+        # Interval data has holes that the daily totals still cover.
+        reads = reconcile_hourly_with_daily(reads, daily)
         for statistic_id, (attr, label) in pending.items():
             if not valid_statistic_id(statistic_id):
                 _LOGGER.warning("Invalid statistic id: %s", statistic_id)
@@ -507,6 +513,11 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         )
         hourly_usage_reads = await self.api.async_get_usage_reads(
             meter, AggregateType.HOUR, start, end
+        )
+        # Only days inside the hourly window; older days stay daily.
+        hourly_usage_reads = reconcile_hourly_with_daily(
+            hourly_usage_reads,
+            [r for r in usage_reads if r.start_time.date() >= start.date()],
         )
         _update_with_finer_usage_reads(usage_reads, hourly_usage_reads)
         return usage_reads
