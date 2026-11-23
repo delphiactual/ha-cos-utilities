@@ -1,5 +1,6 @@
 """Colorado Springs Utilities API."""
 
+import asyncio
 import dataclasses
 import json
 import logging
@@ -23,6 +24,8 @@ from .exceptions import MfaRequired
 TOKEN_URL = "https://myaccount.csu.org/rest/oauth/token"
 # Accounts and services rarely change, and usage data lags by a day or more.
 ACCOUNT_REFRESH_SECONDS = 24 * 60 * 60
+# Seconds to wait before each retry of a failed history window.
+RETRY_DELAYS = (30.0, 120.0, 300.0)
 # Built once at import: constructing it per call reads tzdata from disk, which
 # blocks the event loop when called from async code.
 LOCAL_TZ = ZoneInfo(TIME_ZONE)
@@ -202,12 +205,16 @@ class CSU:
         except (aiohttp.ClientError, TimeoutError) as err:
             raise CannotConnect(err) from err
 
-    async def _async_ensure_token(self) -> bool:
+    async def async_ensure_token(self, min_valid: float) -> bool:
+        """Renew the token unless it stays valid for at least min_valid seconds."""
+        return await self._async_ensure_token(min_valid)
+
+    async def _async_ensure_token(self, min_valid: float = 60) -> bool:
         """Make sure the access token is valid; return True if a new one was issued."""
 
         # The server does not support refresh tokens, and a login may need an MFA
         # code, so keep logins to about one per token lifetime.
-        if self.access_token and time.time() < self.token_expires_at - 60:
+        if self.access_token and time.time() < self.token_expires_at - min_valid:
             return False
         result = await self._async_request_token(
             {
@@ -390,8 +397,16 @@ class CSU:
         aggregate_type: AggregateType,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
+        window_days: int | None = None,
+        strict: bool = False,
+        retry_delays: tuple[float, ...] = RETRY_DELAYS,
     ) -> list[UsageRead]:
-        """Get usage reads for a meter."""
+        """Get usage reads for a meter.
+
+        strict is for long history walks: errors raise (after retries) instead of
+        looking like the end of the history, so a partial result is never mistaken
+        for a complete one.
+        """
 
         if not meter.read_resolution:
             raise ValueError("Meter does not have a read resolution")
@@ -410,6 +425,9 @@ class CSU:
             aggregate_type=aggregate_type,
             start_date=start_date,
             end_date=end_date,
+            window_days=window_days,
+            strict=strict,
+            retry_delays=retry_delays,
         )
         # Key on usageDate, which is always populated. readDateTime is
         # null for export-only (net-metered) intervals, which broke hourly bucketing and dropped
@@ -464,6 +482,9 @@ class CSU:
         aggregate_type: AggregateType,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
+        window_days: int | None = None,
+        strict: bool = False,
+        retry_delays: tuple[float, ...] = RETRY_DELAYS,
     ) -> list[Any]:
         """Break large _async_fetch requests into smaller batches."""
 
@@ -471,12 +492,9 @@ class CSU:
             raise ValueError("start_date is required")
         if end_date is None:
             raise ValueError("end_date is required")
-        # DEN = tz.gettz(TIME_ZONE)
 
         start = start_date.date()
         end = end_date.date()
-        # start = arrow.get(start_date.date(), TIME_ZONE)
-        # end = arrow.get(end_date.date(), TIME_ZONE)
 
         max_request_days = 30
         if aggregate_type == AggregateType.DAY:
@@ -485,6 +503,9 @@ class CSU:
         if aggregate_type in {AggregateType.QUARTER, AggregateType.HOUR}:
             max_request_days = 1
             url_end = "day"
+
+        if window_days is not None:
+            max_request_days = window_days
 
         url = url + url_end
 
@@ -496,11 +517,15 @@ class CSU:
                 req_start = max(start, (req_end - timedelta(days=max_request_days)))
             if req_start >= req_end:
                 return result
-            reads = await self._async_fetch(meter, url, req_start, req_end)
+            if strict:
+                reads = await self._async_fetch_strict(
+                    meter, url, req_start, req_end, retry_delays
+                )
+            else:
+                reads = await self._async_fetch(meter, url, req_start, req_end)
             if not reads:
                 return result
             result = reads + result
-            # req_end = req_start.shift(days=-1)
             req_end = req_end - timedelta(days=max_request_days)
 
     async def _async_fetch(
@@ -543,6 +568,60 @@ class CSU:
             if err.status == 500:
                 return []
             raise
+
+    async def _async_fetch_strict(
+        self,
+        meter: Meter,
+        url: str,
+        start_date: datetime,
+        end_date: datetime,
+        retry_delays: tuple[float, ...],
+    ) -> list[Any]:
+        """Fetch one window, retrying failures; never report an error as empty."""
+        for attempt in range(len(retry_delays) + 1):
+            try:
+                async with self.session.post(
+                    url,
+                    data=json.dumps(self._fetch_body(meter, start_date, end_date)),
+                    headers=self._json_headers(),
+                ) as resp:
+                    if resp.status in (401, 403):
+                        raise InvalidAuth(f"HTTP {resp.status}")
+                    if resp.status >= 400:
+                        raise CannotConnect(f"HTTP {resp.status}")
+                    result = await resp.json(content_type=None)
+                    if not isinstance(result, dict) or "history" not in result:
+                        raise CannotConnect("unexpected usage response")
+                    return result["history"]
+            except (
+                CannotConnect,
+                aiohttp.ClientError,
+                TimeoutError,
+                ValueError,
+            ) as err:
+                if attempt == len(retry_delays):
+                    if isinstance(err, CannotConnect):
+                        raise
+                    raise CannotConnect(err) from err
+                await asyncio.sleep(retry_delays[attempt])
+        raise AssertionError("unreachable")
+
+    def _fetch_body(self, meter: Meter, start_date, end_date) -> dict:
+        return {
+            "customerId": meter.customer.customer_id,
+            "meterNumber": meter.meter_number,
+            "serviceNumber": meter.service_number,
+            "serviceId": meter.service_id,
+            "accountContext": meter.customer.customer_context,
+            "contractNum": meter.contract_num,
+            "fromDate": start_date.strftime("%Y-%m-%d %H:%M"),
+            "toDate": end_date.strftime("%Y-%m-%d %H:%M"),
+        }
+
+    def _json_headers(self) -> dict:
+        headers = self._get_headers()
+        headers["Content-Type"] = "application/json"
+        return headers
 
     def _get_headers(self):
         headers = {"User-Agent": USER_AGENT}

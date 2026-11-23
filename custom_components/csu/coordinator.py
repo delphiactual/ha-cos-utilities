@@ -3,6 +3,7 @@
 import logging
 from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 from typing import Any
 from typing import cast
 
@@ -31,6 +32,7 @@ from homeassistant.util import dt as dt_util  # type: ignore
 
 from .const import CONF_ACCESS_TOKEN
 from .const import CONF_CUSTOMER_ID
+from .const import CONF_HOURLY_REBUILD_DONE
 from .const import CONF_TOKEN_EXPIRES_AT
 from .const import DOMAIN
 from .const import TIME_ZONE
@@ -39,11 +41,22 @@ from .csu import CSU
 from .csu import Meter
 from .csu import MeterType
 from .csu import ReadResolution
+from .csu import SUPPORTED_AGGREGATE_TYPES
 from .csu import UsageRead
 from .exceptions import CannotConnect
 from .exceptions import InvalidAuth
 
 _LOGGER = logging.getLogger(__name__)
+
+# The daily endpoint only keeps a rolling two years; older days come back empty.
+DAILY_HISTORY = timedelta(days=730)
+# The interval endpoint reaches back to service start. Walk in month-sized windows
+# and stop at the first empty one; the cap only guards against a runaway loop.
+HOURLY_WINDOW_DAYS = 30
+HOURLY_MAX_HISTORY = timedelta(days=3650)
+# One token must outlast the whole rebuild, because the server has no refresh
+# and a new login could ask for an MFA code.
+REBUILD_TOKEN_MARGIN = 40 * 60
 
 
 class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
@@ -74,6 +87,8 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         # The update listener compares against this so token saves (data only)
         # don't trigger a reload.
         self.options = dict(entry.options)
+        # A failed rebuild is retried on the next start, not on every poll.
+        self._rebuild_attempted: set[str] = set()
         self.entities = []
         self.data = {
             "monthly_totals": {
@@ -152,7 +167,7 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
                         * self.config_entry.options.get("water_rate_per_day", 0.0)
                     )
             self.data["monthly_totals"][meter.meter_type.name]["cost"] = total_cost
-        # The first import walks ~3 years of history; never block HA startup on it.
+        # The first import walks the whole history; never block HA startup on it.
         if not getattr(self, "_stats_task", None) or self._stats_task.done():
             # Tied to the config entry so unload/reload cancels an in-flight import.
             self._stats_task = self.config_entry.async_create_background_task(
@@ -176,6 +191,7 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         """Insert CSU statistics; net-metered electric also gets an export series."""
         if not self.api.meters:
             await self.api.async_get_meters()
+        token_ready = False
         for meter in self.api.meters:
             id_prefix = (
                 f"csu_{meter.meter_type.name.lower()}_{meter.customer.customer_id}"
@@ -194,8 +210,145 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
                     f"{DOMAIN}:{id_prefix}_{series[0][0]}",
                 )
             self._reads_cache = {}
+            if self._can_rebuild_hourly(meter, id_prefix, series):
+                if not token_ready:
+                    token_ready = await self._async_prepare_rebuild_token()
+                if token_ready:
+                    await self._async_rebuild_hourly(meter, id_prefix, series)
             for suffix, attr, label in series:
                 await self._insert_series(meter, id_prefix, suffix, attr, label)
+
+    def _pending_rebuild(self, id_prefix, series) -> dict:
+        """Series not yet rebuilt and not already tried since this start."""
+        done = set(self.config_entry.data.get(CONF_HOURLY_REBUILD_DONE, []))
+        pending = {}
+        for suffix, attr, label in series:
+            sid = f"{DOMAIN}:{id_prefix}_{suffix}"
+            if sid not in done and sid not in self._rebuild_attempted:
+                pending[sid] = (attr, label)
+        return pending
+
+    def _can_rebuild_hourly(self, meter, id_prefix, series) -> bool:
+        if AggregateType.HOUR not in SUPPORTED_AGGREGATE_TYPES[meter.read_resolution]:
+            return False
+        return bool(self._pending_rebuild(id_prefix, series))
+
+    async def _async_prepare_rebuild_token(self) -> bool:
+        """Get one token for the whole rebuild; a failure only skips the rebuild."""
+        try:
+            await self.api.async_ensure_token(REBUILD_TOKEN_MARGIN)
+        except Exception as err:  # noqa: BLE001
+            # Never start a reauth from a background backfill; try next start.
+            _LOGGER.warning("Skipping the history rebuild for now: %s", err)
+            return False
+        return True
+
+    async def _async_rebuild_hourly(self, meter, id_prefix, series) -> None:
+        """Replace each series with true hourly history, written in one go.
+
+        The sums are recomputed from zero over the full history and written in a
+        single call, so a failure leaves the old, internally consistent rows. The
+        old daily-resolution rows are overwritten, never prepended to.
+        """
+        pending = self._pending_rebuild(id_prefix, series)
+        self._rebuild_attempted.update(pending)
+        if not pending:
+            return
+        end = dt_util.now(await dt_util.async_get_time_zone(TIME_ZONE))
+        try:
+            reads = await self.api.async_get_usage_reads(
+                meter,
+                AggregateType.HOUR,
+                end - HOURLY_MAX_HISTORY,
+                end,
+                window_days=HOURLY_WINDOW_DAYS,
+                strict=True,
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "Hourly history for %s could not be fetched, will retry on the "
+                "next start: %s",
+                meter.meter_type.name,
+                err,
+            )
+            return
+        if not reads:
+            _LOGGER.warning("No hourly history returned for %s", meter.meter_type.name)
+            return
+        for statistic_id, (attr, label) in pending.items():
+            if not valid_statistic_id(statistic_id):
+                _LOGGER.warning("Invalid statistic id: %s", statistic_id)
+                continue
+            points = self._hourly_points(reads, attr)
+            if not await self._rebuild_is_safe(statistic_id, points):
+                continue
+            metadata = self._statistic_metadata(meter, statistic_id, label)
+            _LOGGER.info(
+                "Rebuilding %s with %d hourly points", statistic_id, len(points)
+            )
+            async_add_external_statistics(self.hass, metadata, points)
+            await get_instance(self.hass).async_block_till_done()
+            self._mark_rebuilt(statistic_id)
+
+    @staticmethod
+    def _hourly_points(reads: list[UsageRead], attr: str) -> list[StatisticData]:
+        """Dense hourly points with sums from zero; missing hours count as zero.
+
+        Hours without a read must still get a row, otherwise an old daily-resolution
+        row sitting on that hour would keep its stale sum.
+        """
+        # Step in UTC: wall-clock arithmetic is wrong across DST changes.
+        value_at = {
+            r.start_time.astimezone(timezone.utc): getattr(r, attr) for r in reads
+        }
+        current = min(value_at)
+        last = max(value_at)
+        points = []
+        running_sum = 0.0
+        while current <= last:
+            value = value_at.get(current, 0.0)
+            running_sum += value
+            points.append(StatisticData(start=current, state=value, sum=running_sum))
+            current += timedelta(hours=1)
+        return points
+
+    async def _rebuild_is_safe(self, statistic_id, points) -> bool:
+        """Refuse if old rows would survive outside the new range with stale sums."""
+        recorder = get_instance(self.hass)
+        first, last = points[0]["start"], points[-1]["start"]
+        before = await recorder.async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            datetime.fromtimestamp(0, tz=timezone.utc),
+            first,
+            {statistic_id},
+            "hour",
+            None,
+            {"sum"},
+        )
+        newest = await recorder.async_add_executor_job(
+            get_last_statistics, self.hass, 1, statistic_id, False, set()
+        )
+        newest_start = newest[statistic_id][0]["start"] if newest else None
+        if before.get(statistic_id) or (
+            newest_start is not None and newest_start > last.timestamp()
+        ):
+            _LOGGER.warning(
+                "Not rebuilding %s: it has rows outside the new history", statistic_id
+            )
+            return False
+        return True
+
+    def _mark_rebuilt(self, statistic_id: str) -> None:
+        done = list(self.config_entry.data.get(CONF_HOURLY_REBUILD_DONE, []))
+        if statistic_id not in done:
+            self.hass.config_entries.async_update_entry(
+                self.config_entry,
+                data={
+                    **self.config_entry.data,
+                    CONF_HOURLY_REBUILD_DONE: [*done, statistic_id],
+                },
+            )
 
     async def _migrate_legacy_statistic_id(self, old_id: str, new_id: str) -> None:
         """Rename pre-0.2.0 gas/water statistics so their history is kept."""
@@ -266,12 +419,21 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             value = getattr(usage_read, attr)
             running_sum += value
             points.append(StatisticData(start=start, state=value, sum=running_sum))
+        metadata = self._statistic_metadata(meter, statistic_id, label)
+        if not valid_statistic_id(statistic_id):
+            _LOGGER.warning("Invalid statistic id: %s", statistic_id)
+            return
+        _LOGGER.info("Inserting %d points into %s", len(points), statistic_id)
+        async_add_external_statistics(self.hass, metadata, points)
+
+    @staticmethod
+    def _statistic_metadata(meter, statistic_id, label) -> StatisticMetaData:
         unit = {
             MeterType.ELEC: UnitOfEnergy.KILO_WATT_HOUR,
             MeterType.GAS: UnitOfVolume.CENTUM_CUBIC_FEET,
             MeterType.WATER: UnitOfVolume.CUBIC_FEET,
         }[meter.meter_type]
-        metadata = StatisticMetaData(
+        return StatisticMetaData(
             mean_type=StatisticMeanType.NONE,
             has_sum=True,
             unit_class=(
@@ -287,11 +449,6 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             statistic_id=statistic_id,
             unit_of_measurement=unit,
         )
-        if not valid_statistic_id(statistic_id):
-            _LOGGER.warning("Invalid statistic id: %s", statistic_id)
-            return
-        _LOGGER.info("Inserting %d points into %s", len(points), statistic_id)
-        async_add_external_statistics(self.hass, metadata, points)
 
     async def _async_get_usage_reads(
         self, meter: Meter, time_zone_str: str, start_time: float | None = None
@@ -301,7 +458,7 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         If start_time is None, get usage reads since account activation, otherwise since start_time - 30 days to allow corrections in data from utilities.
 
         We read at different resolutions depending on age:
-        - day resolution for past 3 years
+        - day resolution for the past 2 years (all the daily endpoint keeps)
         - hour resolution for past 2 months
         """
 
@@ -326,11 +483,13 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             usage_reads += finer_usage_reads
 
         tz = await dt_util.async_get_time_zone(time_zone_str)
+        end = dt_util.now(tz)
         if start_time is None:
-            start = dt_util.now(tz) - timedelta(days=3 * 365)
+            start = end - DAILY_HISTORY
         else:
             start = datetime.fromtimestamp(start_time, tz=tz) - timedelta(days=30)
-        end = dt_util.now(tz)
+            # Older days only return empty rows, so don't request them.
+            start = max(start, end - DAILY_HISTORY)
         usage_reads = await self.api.async_get_usage_reads(
             meter, AggregateType.DAY, start, end
         )
@@ -353,5 +512,6 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         return usage_reads
 
         # add in additional update for quarter-hour reads?
+
 
 type CsuConfigEntry = ConfigEntry[CsuCoordinator]

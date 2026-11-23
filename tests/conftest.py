@@ -49,12 +49,18 @@ class FakeSession:
     def __init__(self):
         self._queued = defaultdict(list)
         self.calls = defaultdict(int)
+        self.bodies = defaultdict(list)
 
     def reply(self, url, status=200, payload=None, body=None):
         self._queued[url].append(FakeResponse(status, payload, body))
 
+    def fail(self, url, exc):
+        self._queued[url].append(exc)
+
     def post(self, url, **kwargs):
         self.calls[url] += 1
+        data = kwargs.get("data")
+        self.bodies[url].append(json.loads(data) if isinstance(data, str) else None)
         if not self._queued[url]:
             raise AssertionError(f"unexpected request to {url}")
         return _Call(self._queued[url].pop(0))
@@ -68,7 +74,7 @@ def mod():
     csu = importlib.import_module("csu_pkg.csu")
     exceptions = importlib.import_module("csu_pkg.exceptions")
     return types.SimpleNamespace(
-        CSU=csu.CSU, TOKEN_URL=csu.TOKEN_URL, errors=exceptions
+        CSU=csu.CSU, TOKEN_URL=csu.TOKEN_URL, errors=exceptions, csu=csu
     )
 
 
@@ -101,4 +107,3 @@ def make_api(mod, session, *, token="", expires_in=0):
         token_expires_at=time.time() + expires_in,
         customer_id=CUSTOMER_ID if token else "",
     )
-

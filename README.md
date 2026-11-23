@@ -17,6 +17,20 @@ Before 0.2.0 gas and water were stored as `..._energy_consumption`. On first run
 
 Known limitation: reads are keyed on CSU's local-time labels, so the repeated hour at the autumn DST change may be merged.
 
+### How far back the history goes
+
+CSU keeps different amounts of history per resolution (checked against a live account):
+
+| Data | History available |
+| ---- | ----------------- |
+| Electric and gas, hourly | From service start (a little over 3 years on the account that was checked). |
+| Water, daily | A rolling 2 years. Older days come back empty. |
+| Bills | Only the last 13. They are not imported into statistics. |
+
+Electric (import and export) and gas are imported hourly for their whole history. Water has no hourly data, so it is imported daily for the last 2 years.
+
+Upgrading from 0.2.x to 0.3.0 does a one-time rebuild of the electric and gas statistics in the background after startup. Each series is fetched in full, its sums are recomputed from zero and it is written in a single step, replacing the old one-row-per-day entries for older periods. Because of that, older periods in the Energy dashboard will change. If anything fails (an outage, an expired login), nothing is written and the rebuild is retried the next time Home Assistant starts. It never asks you to sign in again.
+
 ## Smoke test
 
 `scripts/smoke_test.py` logs in with `CSU_USERNAME` / `CSU_PASSWORD` from the environment and prints recent hourly import, export, gas and water usage so it can be checked against the CSU portal:
