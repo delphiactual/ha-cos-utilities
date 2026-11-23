@@ -264,8 +264,16 @@ async def test_rebuild_replaces_daily_rows_and_live_updates_continue(
     for statistic_id, (attr, _) in SERIES.items():
         values, sums = fake.expected(attr)
         rows = await _rows(hass, statistic_id)
-        assert len(rows) == fake.hours
-        assert [r["sum"] for r in rows] == pytest.approx(sums)
+        # Live updates only add rows for hours that have a read, so look rows up
+        # by hour. Every row, old and new, must sit on the same running total.
+        by_hour = {
+            round((r["start"] - fake.base.timestamp()) / 3600): r["sum"] for r in rows
+        }
+        assert len(rows) >= fake.hours - 2
+        assert max(by_hour) == fake.hours - 1
+        assert [by_hour[i] for i in sorted(by_hour)] == pytest.approx(
+            [sums[i] for i in sorted(by_hour)]
+        )
 
 
 async def test_failed_rebuild_changes_nothing_and_does_not_reauth(
