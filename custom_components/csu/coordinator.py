@@ -55,10 +55,13 @@ _LOGGER = logging.getLogger(__name__)
 
 # The daily endpoint only keeps a rolling two years; older days come back empty.
 DAILY_HISTORY = timedelta(days=730)
-# The interval endpoint reaches back to service start. Walk it and stop at the
-# first empty window; the cap only guards against a runaway loop. Long ranges come
-# back with missing reads and a stale tail, so the windows must stay short.
+# The interval endpoint reaches back to service start. Walk it until several
+# empty windows in a row; the cap only guards against a runaway loop. Long
+# ranges come back with missing reads and a stale tail, so the windows must
+# stay short.
 HOURLY_WINDOW_DAYS = 7
+# A gap of a week or two in the interval data must not end the history early.
+HOURLY_EMPTY_WINDOWS = 5
 HOURLY_MAX_HISTORY = timedelta(days=3650)
 # One token must outlast the whole rebuild, because the server has no refresh
 # and a new login could ask for an MFA code.
@@ -300,6 +303,7 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
                 end,
                 window_days=HOURLY_WINDOW_DAYS,
                 strict=True,
+                stop_after_empty=HOURLY_EMPTY_WINDOWS,
             )
             daily = await self.api.async_get_usage_reads(
                 meter, AggregateType.DAY, now - DAILY_HISTORY, end, strict=True
@@ -317,9 +321,21 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             for statistic_id in pending:
                 self._count_refusal(statistic_id)
             return
-        # Electric interval data has holes that the daily totals still cover. Gas
-        # hours without a read are real "no usage" hours, so gas is used as is.
+        _LOGGER.info(
+            "History walk for %s reached back to %s (last read %s)",
+            meter.meter_type.name,
+            self._local(reads[0].start_time),
+            self._local(reads[-1].start_time),
+        )
+        # Electric hours without a read can still be covered by the daily totals.
+        # Gas hours without a read are real "no usage" hours, so gas is used as
+        # is. Today's daily total is partial, so it never takes part.
         if meter.meter_type == MeterType.ELEC:
+            daily = [
+                r
+                for r in daily
+                if r.start_time.astimezone(LOCAL_TZ).date() < now.date()
+            ]
             reads = reconcile_hourly_with_daily(reads, daily)
         for statistic_id, (attr, label) in pending.items():
             if not valid_statistic_id(statistic_id):

@@ -133,12 +133,14 @@ def reconcile_hourly_with_daily(
 ) -> list[UsageRead]:
     """Make hourly reads add up to the daily totals, which are what the portal shows.
 
-    CSU's interval data has holes (null reads, sometimes whole days) on days its
-    daily totals still cover, so summing hourly reads can fall well short. Each
-    day's shortfall is spread over that day's hours that have no read at all, which
-    keeps the daily totals and the real hourly shape. An hour that has a read is
-    real even when its value is zero (no export at night), so it is never filled.
-    Days with no daily read are untouched.
+    A safety net for hours the interval data lacks on days its daily totals still
+    cover. Each day's shortfall is spread over that day's hours that have no read
+    at all, which keeps the daily totals and the real hourly shape. An hour that
+    has a read is real even when its value is zero (no export at night), so it is
+    never filled.
+    Days with no daily read are untouched, and so is any day the hourly reads
+    do not reach the end of: its daily total is still partial, and filling it
+    would invent hours that have not happened yet.
     """
     hours: dict[datetime, list] = {}  # UTC hour -> [import, export, tzinfo]
     for read in hourly:
@@ -146,6 +148,7 @@ def reconcile_hourly_with_daily(
         hours[key] = [read.consumption, read.received, read.start_time.tzinfo]
     # Judge gaps against the original reads, not hours added while filling.
     read_hours = set(hours)
+    last_read = max(read_hours, default=None)
     # Export only happens when the sun is up, so a missing hour can only hold
     # export between the first and last hour of the day where export was seen.
     seen_export = [r.start_time.hour for r in hourly if r.received > 0]
@@ -160,6 +163,8 @@ def reconcile_hourly_with_daily(
         while current.astimezone(tz).date() == day:
             day_hours.append(current)
             current += timedelta(hours=1)
+        if last_read is None or day_hours[-1] > last_read:
+            continue
         for index, attr in enumerate(("consumption", "received")):
             total = sum(hours[h][index] for h in day_hours if h in hours)
             shortfall = getattr(day_read, attr) - total
@@ -458,6 +463,7 @@ class CSU:
         window_days: int | None = None,
         strict: bool = False,
         retry_delays: tuple[float, ...] = RETRY_DELAYS,
+        stop_after_empty: int = 1,
     ) -> list[UsageRead]:
         """Get usage reads for a meter.
 
@@ -486,6 +492,7 @@ class CSU:
             window_days=window_days,
             strict=strict,
             retry_delays=retry_delays,
+            stop_after_empty=stop_after_empty,
         )
         # Key on usageDate, which is always populated. readDateTime is
         # null for export-only (net-metered) intervals, which broke hourly bucketing and dropped
@@ -543,6 +550,7 @@ class CSU:
         window_days: int | None = None,
         strict: bool = False,
         retry_delays: tuple[float, ...] = RETRY_DELAYS,
+        stop_after_empty: int = 1,
     ) -> list[Any]:
         """Break large _async_fetch requests into smaller batches."""
 
@@ -569,6 +577,7 @@ class CSU:
 
         result: list[Any] = []
         req_end = end
+        empty_in_a_row = 0
         while True:
             req_start = start
             if max_request_days is not None:
@@ -581,9 +590,13 @@ class CSU:
                 )
             else:
                 reads = await self._async_fetch(meter, url, req_start, req_end)
-            if not reads:
-                return result
-            result = reads + result
+            if reads:
+                empty_in_a_row = 0
+                result = reads + result
+            else:
+                empty_in_a_row += 1
+                if empty_in_a_row >= stop_after_empty:
+                    return result
             req_end = req_end - timedelta(days=max_request_days)
 
     async def _async_fetch(

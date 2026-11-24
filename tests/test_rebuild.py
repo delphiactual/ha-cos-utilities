@@ -28,6 +28,7 @@ from custom_components.csu.const import CONF_HOURLY_REBUILD_VERSION
 from custom_components.csu.const import DOMAIN
 from custom_components.csu.coordinator import CsuCoordinator
 from custom_components.csu.coordinator import DAILY_HISTORY
+from custom_components.csu.coordinator import HOURLY_EMPTY_WINDOWS
 from custom_components.csu.coordinator import HOURLY_WINDOW_DAYS
 from custom_components.csu.coordinator import REBUILD_MAX_TAIL
 from custom_components.csu.coordinator import REBUILD_MAX_REFUSALS
@@ -96,6 +97,9 @@ class FakeCsu:
         self.deep_calls = Counter()
         self.deep_windows = []
         self.deep_ends = []
+        self.deep_empty = []
+        # Hours read so far on a last day whose daily total is still partial.
+        self.partial = 0
         self.water_hour_calls = 0
         self.water_day_spans = []
         self.elec = _meter(1, MeterType.ELEC, ReadResolution.QUARTER_HOUR)
@@ -104,7 +108,7 @@ class FakeCsu:
 
     def hourly(self):
         reads = []
-        for i in range(self.hours):
+        for i in range(self.hours + self.partial):
             if not _has_read(i):
                 continue
             start = self.base + i * HOUR
@@ -131,6 +135,19 @@ class FakeCsu:
                     end_time=start + timedelta(days=1),
                     consumption=sum(_truth("consumption", i) for i in hours),
                     received=sum(_truth("received", i) for i in hours),
+                )
+            )
+        if self.partial:
+            start = self.base + timedelta(days=self.hours // 24)
+            hours = range(self.hours, self.hours + self.partial)
+            reads.append(
+                UsageRead(
+                    meter=self.elec,
+                    start_time=start,
+                    end_time=start + timedelta(days=1),
+                    # More than the hours read so far, so filling would show.
+                    consumption=sum(_truth("consumption", i) for i in hours) + 5.0,
+                    received=sum(_truth("received", i) for i in hours) + 1.0,
                 )
             )
         return reads
@@ -185,6 +202,7 @@ class FakeCsu:
                 self.deep_calls[meter.meter_type] += 1
                 self.deep_windows.append(kwargs.get("window_days"))
                 self.deep_ends.append(end)
+                self.deep_empty.append(kwargs.get("stop_after_empty"))
                 if self.fail_deep:
                     raise CannotConnect("fake outage")
             return reads
@@ -461,6 +479,9 @@ async def test_walk_uses_short_windows_and_reaches_tomorrow(
     # Long ranges come back from CSU with missing reads and a stale tail.
     assert HOURLY_WINDOW_DAYS <= 14
     assert set(fake.deep_windows) == {HOURLY_WINDOW_DAYS}
+    # One empty week must not end the history.
+    assert set(fake.deep_empty) == {HOURLY_EMPTY_WINDOWS}
+    assert HOURLY_EMPTY_WINDOWS > 1
     ahead = fake.deep_ends[0] - dt_util.now()
     assert timedelta(hours=23) < ahead < timedelta(hours=25)
 
@@ -579,3 +600,37 @@ async def test_electric_rebuilt_by_0_3_0_or_0_3_1_is_redone_but_gas_is_kept(
     assert fake.deep_calls[MeterType.ELEC] == 1
     assert fake.deep_calls[MeterType.GAS] == 0
     assert set(entry.data[CONF_HOURLY_REBUILD_DONE]) == {IMPORT_ID, EXPORT_ID, GAS_ID}
+
+
+async def test_rebuild_never_fills_hours_that_have_not_happened(
+    recorder_mock, enable_custom_integrations, hass, entry, fake, patched_api
+):
+    # The last day has reads through 05:00 and a daily total that is still partial.
+    fake.partial = 6
+
+    coordinator = await _setup(hass, entry)
+
+    assert IMPORT_ID in entry.data[CONF_HOURLY_REBUILD_DONE]
+    last = fake.hours + fake.partial - 1
+    rows = await _rows(hass, IMPORT_ID)
+    by_hour = _by_hour(fake, rows)
+    assert max(by_hour) == last  # nothing after 05:00
+    for i in range(fake.hours, last + 1):
+        expected = _truth("consumption", i) if _has_read(i) else 0.0
+        assert by_hour[i]["state"] == pytest.approx(expected)
+    _check_chain(rows)
+    rebuilt = [r["sum"] for r in rows]
+
+    # The next poll sees more hours of that day; they must be written, not skipped.
+    fake.partial = 12
+    await coordinator._insert_statistics()
+    await get_instance(hass).async_block_till_done()
+
+    rows = await _rows(hass, IMPORT_ID)
+    by_hour = _by_hour(fake, rows)
+    assert max(by_hour) == fake.hours + 11
+    for i in range(fake.hours + 6, fake.hours + 12):
+        if _has_read(i):
+            assert by_hour[i]["state"] == pytest.approx(_truth("consumption", i))
+    assert [r["sum"] for r in rows[: len(rebuilt)]] == pytest.approx(rebuilt)
+    _check_chain(rows)

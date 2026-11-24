@@ -161,6 +161,8 @@ def test_reconcile_fills_a_day_with_no_interval_data(mod, meter):
         )
         for h in range(24)
     ]
+    # A later real read shows the hourly walk got past the missing day.
+    real.append(_read(mod, meter, day + timedelta(days=1), imp=1.0))
     daily = [
         _read(mod, meter, before, imp=24.0, exp=3.5, hours=24),
         _read(mod, meter, day, imp=24.0, exp=2.4, hours=24),
@@ -179,8 +181,9 @@ def test_reconcile_fills_a_day_with_no_interval_data(mod, meter):
 def test_reconcile_skips_export_when_none_was_ever_seen(mod, meter):
     day = _day(mod, 2026, 5, 10)
     daily = [_read(mod, meter, day, imp=24.0, exp=2.4, hours=24)]
+    later = [_read(mod, meter, day + timedelta(days=1), imp=1.0)]
 
-    out = mod.csu.reconcile_hourly_with_daily([], daily)
+    out = _hours_of(mod.csu.reconcile_hourly_with_daily(later, daily), day)
 
     assert sum(r.consumption for r in out) == pytest.approx(24.0)
     assert sum(r.received for r in out) == 0.0
@@ -231,9 +234,10 @@ def test_reconcile_never_fills_a_present_hour_even_when_its_value_is_zero(mod, m
 def test_reconcile_only_adds_to_hours_without_data(mod, meter):
     day = _day(mod, 2026, 5, 10)
     real = [_read(mod, meter, day + timedelta(hours=h), imp=1.0) for h in range(10)]
+    real.append(_read(mod, meter, day + timedelta(days=1), imp=1.0))
     daily = [_read(mod, meter, day, imp=24.0, hours=24)]
 
-    out = mod.csu.reconcile_hourly_with_daily(real, daily)
+    out = _hours_of(mod.csu.reconcile_hourly_with_daily(real, daily), day)
 
     assert sum(r.consumption for r in out) == pytest.approx(24.0)
     assert len(out) == 24
@@ -271,9 +275,82 @@ def test_reconcile_never_removes_when_hourly_exceeds_daily(mod, meter):
 def test_reconcile_handles_dst_days(mod, meter, day, hours):
     start = _day(mod, *day)
     daily = [_read(mod, meter, start, imp=float(hours), hours=hours)]
+    later = [_read(mod, meter, start + timedelta(days=2), imp=1.0)]
 
-    out = mod.csu.reconcile_hourly_with_daily([], daily)
+    out = _hours_of(mod.csu.reconcile_hourly_with_daily(later, daily), start)
 
     assert len(out) == hours
     assert len({r.start_time.astimezone(timezone.utc) for r in out}) == hours
     assert sum(r.consumption for r in out) == pytest.approx(float(hours))
+
+
+def test_reconcile_never_fills_today_or_hours_that_have_not_happened(mod, meter):
+    yesterday = _day(mod, 2026, 5, 9)
+    today = _day(mod, 2026, 5, 10)
+    # Yesterday is complete except hour 3; today has reads through 05:00 only.
+    real = [
+        _read(mod, meter, yesterday + timedelta(hours=h), imp=1.0)
+        for h in range(24)
+        if h != 3
+    ]
+    real += [_read(mod, meter, today + timedelta(hours=h), imp=1.0) for h in range(6)]
+    daily = [
+        _read(mod, meter, yesterday, imp=24.0, hours=24),
+        _read(mod, meter, today, imp=10.0, hours=24),  # partial: the day isn't over
+    ]
+
+    out = mod.csu.reconcile_hourly_with_daily(real, daily)
+
+    # The earlier, fully covered day still gets its missing hour.
+    assert sum(r.consumption for r in _hours_of(out, yesterday)) == pytest.approx(24.0)
+    # Today stays exactly as read, and nothing is added after 05:00.
+    assert [(r.start_time, r.consumption) for r in _hours_of(out, today)] == [
+        (r.start_time, r.consumption) for r in real[-6:]
+    ]
+    assert max(r.start_time for r in out) == today + timedelta(hours=5)
+
+
+async def test_walk_continues_past_an_empty_window_when_asked_to(mod, session, meter):
+    api = make_api(mod, session, token=SAVED_TOKEN, expires_in=3000)
+    session.reply(HOURLY_URL, payload=_rows("2026-04-01"))
+    session.reply(HOURLY_URL, payload={"history": []})  # a gap in the middle
+    session.reply(HOURLY_URL, payload=_rows("2026-02-01"))
+    session.reply(HOURLY_URL, payload=_rows("2026-01-05"))
+
+    reads = await _hourly(api, mod, meter, window_days=30, stop_after_empty=2)
+
+    assert len(reads) == 3
+    assert session.calls[HOURLY_URL] == 4
+
+
+async def test_walk_ends_after_that_many_empty_windows_in_a_row(mod, session, meter):
+    api = make_api(mod, session, token=SAVED_TOKEN, expires_in=3000)
+    session.reply(HOURLY_URL, payload=_rows("2026-04-01"))
+    session.reply(HOURLY_URL, payload={"history": []})
+    session.reply(HOURLY_URL, payload={"history": []})
+
+    reads = await _hourly(api, mod, meter, window_days=30, stop_after_empty=2)
+
+    assert len(reads) == 1
+    assert session.calls[HOURLY_URL] == 3  # the fourth window is never requested
+
+
+async def test_the_empty_count_starts_over_after_a_window_with_reads(
+    mod, session, meter
+):
+    api = make_api(mod, session, token=SAVED_TOKEN, expires_in=3000)
+    for payload in (
+        {"history": []},
+        _rows("2026-03-20"),
+        {"history": []},
+        _rows("2026-02-01"),
+        {"history": []},
+        {"history": []},
+    ):
+        session.reply(HOURLY_URL, payload=payload)
+
+    reads = await _hourly(api, mod, meter, window_days=15, stop_after_empty=2)
+
+    # Single empty windows never add up; only two in a row end the walk.
+    assert len(reads) == 2
+    assert session.calls[HOURLY_URL] == 6
