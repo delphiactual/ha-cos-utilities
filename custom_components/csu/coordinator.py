@@ -62,7 +62,7 @@ HOURLY_WINDOW_DAYS = 7
 HOURLY_MAX_HISTORY = timedelta(days=3650)
 # One token must outlast the whole rebuild, because the server has no refresh
 # and a new login could ask for an MFA code.
-REBUILD_TOKEN_MARGIN = 40 * 60
+REBUILD_TOKEN_MARGIN = 50 * 60
 # A series whose history can never be rebuilt safely stops being retried.
 REBUILD_MAX_REFUSALS = 3
 # Existing rows this far past the walk's last point are data lag; more means
