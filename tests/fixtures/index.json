@@ -1,0 +1,314 @@
+{
+  "captured_at_denver": "2026-11-24T06:22:55.423916-07:00",
+  "login": {
+    "token": "login_token.json",
+    "accounts": "login_accounts.json",
+    "services": "login_services.json"
+  },
+  "windows": [
+    {
+      "url_path": "/rest/usage/detail/day",
+      "meter": "elec",
+      "fromDate": "2026-11-18 00:00",
+      "toDate": "2026-11-25 00:00",
+      "status": 200,
+      "rows": 768,
+      "tags": [
+        "recent"
+      ],
+      "file": "elec_hourly_2026-11-18_2026-11-25.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/day",
+      "meter": "elec",
+      "fromDate": "2026-10-28 00:00",
+      "toDate": "2026-11-04 00:00",
+      "status": 200,
+      "rows": 768,
+      "tags": [
+        "dst-2026-11-01"
+      ],
+      "file": "elec_hourly_2026-10-28_2026-11-04.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/day",
+      "meter": "elec",
+      "fromDate": "2026-03-04 00:00",
+      "toDate": "2026-03-11 00:00",
+      "status": 200,
+      "rows": 764,
+      "tags": [
+        "dst-2026-03-08"
+      ],
+      "file": "elec_hourly_2026-03-04_2026-03-11.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/day",
+      "meter": "elec",
+      "fromDate": "2025-12-03 00:00",
+      "toDate": "2025-12-10 00:00",
+      "status": 200,
+      "rows": 768,
+      "tags": [
+        "null-export"
+      ],
+      "file": "elec_hourly_2025-12-03_2025-12-10.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/day",
+      "meter": "elec",
+      "fromDate": "2023-03-29 00:00",
+      "toDate": "2023-04-05 00:00",
+      "status": 200,
+      "rows": 768,
+      "tags": [
+        "service-start"
+      ],
+      "file": "elec_hourly_2023-03-29_2023-04-05.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/day",
+      "meter": "elec",
+      "fromDate": "2023-03-22 00:00",
+      "toDate": "2023-03-29 00:00",
+      "status": 200,
+      "rows": 0,
+      "tags": [
+        "empty"
+      ],
+      "file": "elec_hourly_2023-03-22_2023-03-29.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/month",
+      "meter": "elec",
+      "fromDate": "2026-09-26 00:00",
+      "toDate": "2026-11-25 00:00",
+      "status": 200,
+      "rows": 61,
+      "tags": [
+        "dst-2026-11-01",
+        "recent"
+      ],
+      "file": "elec_daily_2026-09-26_2026-11-25.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/month",
+      "meter": "elec",
+      "fromDate": "2026-01-29 00:00",
+      "toDate": "2026-03-30 00:00",
+      "status": 200,
+      "rows": 61,
+      "tags": [
+        "dst-2026-03-08"
+      ],
+      "file": "elec_daily_2026-01-29_2026-03-30.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/day",
+      "meter": "elec",
+      "fromDate": "2026-11-23 00:00",
+      "toDate": "2026-11-24 00:00",
+      "status": 200,
+      "rows": 192,
+      "tags": [
+        "recent"
+      ],
+      "file": "elec_hourly_2026-11-23_2026-11-24.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/day",
+      "meter": "elec",
+      "fromDate": "2026-11-22 00:00",
+      "toDate": "2026-11-23 00:00",
+      "status": 200,
+      "rows": 192,
+      "tags": [
+        "recent"
+      ],
+      "file": "elec_hourly_2026-11-22_2026-11-23.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/day",
+      "meter": "elec",
+      "fromDate": "2026-11-21 00:00",
+      "toDate": "2026-11-22 00:00",
+      "status": 200,
+      "rows": 192,
+      "tags": [
+        "recent"
+      ],
+      "file": "elec_hourly_2026-11-21_2026-11-22.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/month",
+      "meter": "elec",
+      "fromDate": "2026-10-25 00:00",
+      "toDate": "2026-11-24 00:00",
+      "status": 200,
+      "rows": 31,
+      "tags": [
+        "dst-2026-11-01",
+        "recent"
+      ],
+      "file": "elec_daily_2026-10-25_2026-11-24.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/month",
+      "meter": "elec",
+      "fromDate": "2026-11-23 00:00",
+      "toDate": "2026-11-25 00:00",
+      "status": 200,
+      "rows": 3,
+      "tags": [
+        "recent"
+      ],
+      "file": "elec_daily_2026-11-23_2026-11-25.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/month",
+      "meter": "elec",
+      "fromDate": "2026-11-24 00:00",
+      "toDate": "2026-11-25 00:00",
+      "status": 200,
+      "rows": 2,
+      "tags": [
+        "recent"
+      ],
+      "file": "elec_daily_2026-11-24_2026-11-25.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/day",
+      "meter": "gas",
+      "fromDate": "2026-11-18 00:00",
+      "toDate": "2026-11-25 00:00",
+      "status": 200,
+      "rows": 192,
+      "tags": [
+        "recent"
+      ],
+      "file": "gas_hourly_2026-11-18_2026-11-25.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/day",
+      "meter": "gas",
+      "fromDate": "2026-10-28 00:00",
+      "toDate": "2026-11-04 00:00",
+      "status": 200,
+      "rows": 192,
+      "tags": [
+        "dst-2026-11-01"
+      ],
+      "file": "gas_hourly_2026-10-28_2026-11-04.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/day",
+      "meter": "gas",
+      "fromDate": "2026-03-04 00:00",
+      "toDate": "2026-03-11 00:00",
+      "status": 200,
+      "rows": 191,
+      "tags": [
+        "dst-2026-03-08"
+      ],
+      "file": "gas_hourly_2026-03-04_2026-03-11.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/day",
+      "meter": "gas",
+      "fromDate": "2023-03-29 00:00",
+      "toDate": "2023-04-05 00:00",
+      "status": 200,
+      "rows": 192,
+      "tags": [
+        "service-start"
+      ],
+      "file": "gas_hourly_2023-03-29_2023-04-05.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/day",
+      "meter": "gas",
+      "fromDate": "2023-03-22 00:00",
+      "toDate": "2023-03-29 00:00",
+      "status": 200,
+      "rows": 0,
+      "tags": [
+        "empty"
+      ],
+      "file": "gas_hourly_2023-03-22_2023-03-29.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/month",
+      "meter": "gas",
+      "fromDate": "2026-09-26 00:00",
+      "toDate": "2026-11-25 00:00",
+      "status": 200,
+      "rows": 61,
+      "tags": [
+        "dst-2026-11-01",
+        "recent"
+      ],
+      "file": "gas_daily_2026-09-26_2026-11-25.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/month",
+      "meter": "gas",
+      "fromDate": "2026-01-29 00:00",
+      "toDate": "2026-03-30 00:00",
+      "status": 200,
+      "rows": 61,
+      "tags": [
+        "dst-2026-03-08"
+      ],
+      "file": "gas_daily_2026-01-29_2026-03-30.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/day",
+      "meter": "gas",
+      "fromDate": "2026-11-23 00:00",
+      "toDate": "2026-11-24 00:00",
+      "status": 200,
+      "rows": 0,
+      "tags": [
+        "recent"
+      ],
+      "file": "gas_hourly_2026-11-23_2026-11-24.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/month",
+      "meter": "gas",
+      "fromDate": "2026-10-25 00:00",
+      "toDate": "2026-11-24 00:00",
+      "status": 200,
+      "rows": 31,
+      "tags": [
+        "dst-2026-11-01",
+        "recent"
+      ],
+      "file": "gas_daily_2026-10-25_2026-11-24.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/month",
+      "meter": "gas",
+      "fromDate": "2026-11-23 00:00",
+      "toDate": "2026-11-25 00:00",
+      "status": 200,
+      "rows": 3,
+      "tags": [
+        "recent"
+      ],
+      "file": "gas_daily_2026-11-23_2026-11-25.json.gz"
+    },
+    {
+      "url_path": "/rest/usage/detail/month",
+      "meter": "gas",
+      "fromDate": "2026-11-24 00:00",
+      "toDate": "2026-11-25 00:00",
+      "status": 200,
+      "rows": 2,
+      "tags": [
+        "recent"
+      ],
+      "file": "gas_daily_2026-11-24_2026-11-25.json.gz"
+    }
+  ]
+}

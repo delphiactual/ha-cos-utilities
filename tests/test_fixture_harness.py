@@ -3,6 +3,7 @@
 Every identifier below is invented. The real capture never goes through the tests.
 """
 
+import gzip
 import importlib.util
 import json
 import sys
@@ -136,6 +137,7 @@ def build_capture(root: Path, extra_secret_row: str | None = None) -> Path:
             "accountSummaryType": {
                 "servicesForGraph": [
                     {
+                        "servDescr": "Net meter MTR-ELEC-3141 (export)",
                         "meterNumber": "MTR-ELEC-3141",
                         "serviceNumber": "E-NET",
                         "serviceId": "SVC-ELEC-2718",
@@ -222,7 +224,12 @@ def fixtures(tmp_path, scrub_mod):
 
 
 def test_scrubbed_output_has_none_of_the_original_values(fixtures):
-    text = "".join(p.read_text(encoding="utf-8") for p in fixtures.iterdir())
+    text = "".join(
+        (
+            gzip.decompress(p.read_bytes()) if p.suffix == ".gz" else p.read_bytes()
+        ).decode("utf-8")
+        for p in fixtures.iterdir()
+    )
     for original in ORIGINALS:
         assert original not in text
     assert "Pat" not in text
@@ -246,9 +253,9 @@ def test_only_the_wanted_windows_are_kept(fixtures):
 
 
 def test_usage_windows_differ_from_the_capture_only_in_the_swapped_values(fixtures):
-    kept = (fixtures / "elec_hourly_2026-11-18_2026-11-25.json").read_text(
-        encoding="utf-8"
-    )
+    kept = gzip.decompress(
+        (fixtures / "elec_hourly_2026-11-18_2026-11-25.json.gz").read_bytes()
+    ).decode("utf-8")
     assert kept == ELEC_RECENT.replace("MTR-ELEC-3141", "fake-meter-elec")
 
 

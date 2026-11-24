@@ -20,6 +20,7 @@ of value but never printing the value itself.
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import re
@@ -52,7 +53,7 @@ USAGE_PATHS = (HOURLY_PATH, DAILY_PATH)
 SENSITIVE_KEY = re.compile(
     r"name|address|street|city|state|zip|postal|email|mail|phone|contact|premise|"
     r"location|latitude|longitude|owner|token|secret|password|account|customer|"
-    r"contract|meter|service|mfa",
+    r"contract|meter|service|mfa|meas|jti|transaction|lastfailed",
     re.IGNORECASE,
 )
 # Kept as they are: not identifying, and the client reads them.
@@ -66,6 +67,11 @@ SERVICE_KEYS = (
 )
 PREFIX_ALIASES = {"E-": "elec", "G-": "gas", "W-": "water"}
 SERVICE_PREFIXES = {"elec": "E-", "gas": "G-", "water": "W-"}
+# Anything shaped like an identifier is swapped whatever its key is called.
+ID_LIKE = re.compile(
+    r"^(\d{8,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+    re.IGNORECASE,
+)
 MIN_STRING = 4  # shorter values only get swapped by key, never searched for
 MIN_DIGITS = 6
 
@@ -176,8 +182,21 @@ def collect_identities(raw: dict[str, object]) -> Fakes:
     return fakes
 
 
+def swap_inside(value: str, fakes: Fakes) -> str:
+    """Swap known originals that sit inside a longer text, such as a description."""
+    ordered = sorted(fakes.map.items(), key=lambda kv: -len(str(kv[0])))
+    for original, fake in ordered:
+        if isinstance(original, str) and len(original) >= MIN_STRING:
+            value = re.sub(re.escape(original), str(fake), value, flags=re.IGNORECASE)
+    return value
+
+
 def scrub_login(name: str, parsed, fakes: Fakes, kept: dict[str, set]):
-    """Swap values by key and by known original; remember the keys left as they are."""
+    """Swap values by key and by known original; remember the keys left as they are.
+
+    Runs twice so every original is known before any text is searched for them,
+    whatever order the fields come in.
+    """
 
     def swap(key, value):
         if value in fakes.map and (significant(value) or SENSITIVE_KEY.search(key)):
@@ -185,11 +204,14 @@ def scrub_login(name: str, parsed, fakes: Fakes, kept: dict[str, set]):
         if key in KEEP_KEYS:
             kept[name].add(key)
             return value
-        if SENSITIVE_KEY.search(key):
+        if SENSITIVE_KEY.search(key) or (
+            isinstance(value, str) and ID_LIKE.match(value)
+        ):
             return fakes.get(value, slug(key))
         kept[name].add(key)
-        return value
+        return swap_inside(value, fakes) if isinstance(value, str) else value
 
+    map_leaves(parsed, swap)
     return map_leaves(parsed, swap)
 
 
@@ -385,7 +407,7 @@ def scrub(capture: Path, out: Path, forbidden: tuple[str, ...] = ()) -> dict:
         swapped_total += swapped
         endpoint = "hourly" if e["url_path"] == HOURLY_PATH else "daily"
         filename = (
-            f"{e['alias']}_{endpoint}_{e['fromDate'][:10]}_{e['toDate'][:10]}.json"
+            f"{e['alias']}_{endpoint}_{e['fromDate'][:10]}_{e['toDate'][:10]}.json.gz"
         )
         if filename in files:
             continue  # the same window recorded twice
@@ -418,6 +440,9 @@ def scrub(capture: Path, out: Path, forbidden: tuple[str, ...] = ()) -> dict:
         shutil.rmtree(out)
     out.mkdir(parents=True)
     for name, data in files.items():
+        if name.endswith(".gz"):
+            # Windows compress about 10 to 1; a fixed mtime keeps the bytes stable.
+            data = gzip.compress(data, mtime=0)
         (out / name).write_bytes(data)
     return {
         "files": {name: len(data) for name, data in files.items()},

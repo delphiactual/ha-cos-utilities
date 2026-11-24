@@ -12,6 +12,7 @@ which answers those with the recorded empty reply, like the end of the history.
 
 from __future__ import annotations
 
+import gzip
 import json
 from collections import defaultdict
 from datetime import datetime
@@ -52,7 +53,10 @@ class FixtureSession:
         return datetime.fromisoformat(self.index["captured_at_denver"])
 
     def _read(self, name: str) -> str:
-        return (self.dir / name).read_text(encoding="utf-8")
+        data = (self.dir / name).read_bytes()
+        if name.endswith(".gz"):
+            data = gzip.decompress(data)
+        return data.decode("utf-8")
 
     def _empty_reply(self) -> str:
         for window in self.index["windows"]:
