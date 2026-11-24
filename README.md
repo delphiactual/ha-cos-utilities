@@ -39,7 +39,7 @@ Upgrading from 0.2.x does a one-time rebuild of the electric and gas statistics 
 
 If Home Assistant already holds a few hours of live data past the end of the fetched history (CSU's data lags), those rows are kept and their sums continue from the rebuilt ones in the same write. If a series can never be rebuilt safely (for example it has rows before the oldest fetched hour), the log says which times were involved, and after 3 starts it stops trying and keeps the existing history. A new release gets a fresh 3 tries, and statistics rebuilt by 0.3.0, 0.3.1 or 0.3.2 are rebuilt again, because the regular update of those releases wrote a broken sum chain.
 
-The regular update rewrites the last 2 months hour by hour, starting from the row before that window. Hours CSU has no read for are written as zero, so every hour in the window gets a row, and daily totals are never written on top of hours that have hourly reads.
+The regular update rewrites the last 30 days hour by hour, starting from the row before the first day it has data for. Within a day CSU reported on, hours without a read are written as zero. A day with no reads at all (CSU posts gas a day or two late, and a request can fail) is left as it is, and its stored hours stay in the sum chain. Daily totals are never written on top of hours that have hourly reads.
 
 ## Smoke test
 

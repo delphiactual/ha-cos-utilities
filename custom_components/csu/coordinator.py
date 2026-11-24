@@ -42,7 +42,7 @@ from .const import DOMAIN
 from .const import TIME_ZONE
 from .csu import AggregateType
 from .csu import CSU
-from .csu import dense_hourly_reads
+from .csu import HOURLY_WINDOW_DAYS
 from .csu import LOCAL_TZ
 from .csu import Meter
 from .csu import MeterType
@@ -61,7 +61,6 @@ DAILY_HISTORY = timedelta(days=730)
 # empty windows in a row; the cap only guards against a runaway loop. Long
 # ranges come back with missing reads and a stale tail, so the windows must
 # stay short.
-HOURLY_WINDOW_DAYS = 7
 # A gap of a week or two in the interval data must not end the history early.
 HOURLY_EMPTY_WINDOWS = 5
 HOURLY_MAX_HISTORY = timedelta(days=3650)
@@ -451,10 +450,14 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
 
     async def _rows_after(self, statistic_id: str, last: datetime) -> list[dict]:
         """Existing rows after the hour `last`, with their states."""
+        return await self._rows_from(statistic_id, last + timedelta(hours=1))
+
+    async def _rows_from(self, statistic_id: str, since: datetime) -> list[dict]:
+        """Existing rows from the hour `since` on, with their states."""
         after = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
-            last + timedelta(hours=1),
+            since,
             None,
             {statistic_id},
             "hour",
@@ -577,10 +580,28 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
                 StatisticData(start=usage_read.start_time, state=value, sum=running_sum)
             )
         if last_stat and points:
-            # Rows already past the last hour read stay, summed on from this chain.
-            points += self._chain_rows(
-                await self._rows_after(statistic_id, points[-1]["start"]), running_sum
-            )
+            # Rows this fetch did not cover (days CSU has no data for yet, or a
+            # failed window, and rows past the last read) keep their own state and
+            # are summed on from this chain.
+            kept = await self._rows_from(statistic_id, points[0]["start"])
+            written = {p["start"].timestamp() for p in points}
+            extra = [r for r in kept if r["start"] not in written]
+            if extra:
+                chained = {
+                    p["start"].timestamp(): (p["state"], p["start"]) for p in points
+                }
+                for row in extra:
+                    chained[row["start"]] = (
+                        row["state"] or 0.0,
+                        datetime.fromtimestamp(row["start"], tz=timezone.utc),
+                    )
+                running_sum = await self._sum_before(statistic_id, points[0]["start"])
+                points = []
+                for _, (state, start) in sorted(chained.items()):
+                    running_sum += state
+                    points.append(
+                        StatisticData(start=start, state=state, sum=running_sum)
+                    )
         metadata = self._statistic_metadata(meter, statistic_id, label)
         if not valid_statistic_id(statistic_id):
             _LOGGER.warning("Invalid statistic id: %s", statistic_id)
@@ -620,10 +641,10 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         If start_time is None, get usage reads since account activation, otherwise
         since start_time - 30 days to allow corrections in data from utilities.
 
-        Hourly meters get hourly reads for the past 2 months, one per hour with zero
-        for hours CSU has no read for. Daily reads only cover days before that
-        window, and only on a first import: inside it, or on top of an hourly
-        history, a daily total would overwrite hours that already have real reads.
+        Hourly meters get hourly reads for the past 2 months at most, one per hour
+        of every day CSU has data for (zero for hours it has no read for). Daily reads
+        only cover days before that window, and only on a first import: inside it, or
+        on top of an hourly history, a daily total would overwrite real hourly reads.
         """
         tz = await dt_util.async_get_time_zone(time_zone_str)
         end = dt_util.now(tz)
@@ -647,20 +668,14 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         _LOGGER.debug(
             "Meter is hourly. Getting finer data stats for %s until %s", start, end
         )
-        hourly_usage_reads = await self.api.async_get_usage_reads(
-            meter, AggregateType.HOUR, start, end
+        # Through tomorrow's midnight, like the rebuild walk, so windows line up.
+        hourly = await self.api.async_get_recent_hourly(
+            meter, start, end + timedelta(days=1), usage_reads
         )
-        if not hourly_usage_reads:
+        if not hourly:
             # Nothing hourly to write; a first import still gets the daily history.
             return usage_reads if start_time is None else []
-        # Only days inside the hourly window; older days stay daily.
-        if meter.meter_type == MeterType.ELEC:
-            hourly_usage_reads = reconcile_hourly_with_daily(
-                hourly_usage_reads,
-                [r for r in usage_reads if r.start_time.date() >= start.date()],
-            )
         window_start = datetime.combine(start.date(), time.min, tzinfo=tz)
-        hourly = dense_hourly_reads(meter, hourly_usage_reads, window_start)
         if start_time is not None:
             return hourly
         return [r for r in usage_reads if r.end_time <= window_start] + hourly

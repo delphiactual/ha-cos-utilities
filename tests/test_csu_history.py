@@ -400,3 +400,33 @@ def test_dense_hourly_reads_step_through_dst_changes(mod, meter, day, last_hour,
 
     assert len(out) == rows
     assert len({r.start_time.astimezone(timezone.utc) for r in out}) == rows
+
+
+async def test_walk_goes_through_every_window_when_never_asked_to_stop(
+    mod, session, meter
+):
+    api = make_api(mod, session, token=SAVED_TOKEN, expires_in=3000)
+    session.reply(HOURLY_URL, payload={"history": []})  # not posted yet
+    session.reply(HOURLY_URL, payload=_rows("2026-03-01"))
+    session.reply(HOURLY_URL, payload={"history": []})
+    session.reply(HOURLY_URL, payload=_rows("2026-01-05"))
+
+    reads = await _hourly(api, mod, meter, window_days=30, stop_after_empty=None)
+
+    assert len(reads) == 2
+    assert session.calls[HOURLY_URL] == 4
+
+
+def test_dense_hourly_reads_leave_a_day_without_reads_alone(mod, meter):
+    window = _day(mod, 2026, 5, 10)
+    reads = [
+        _read(mod, meter, window + timedelta(hours=h), imp=1.0) for h in (3, 5)
+    ] + [_read(mod, meter, window + timedelta(days=2, hours=1), imp=2.0)]
+
+    out = mod.csu.dense_hourly_reads(meter, reads, window)
+
+    days = [r.start_time.date().day for r in out]
+    assert set(days) == {10, 12}  # nothing at all for the 11th
+    assert days.count(10) == 24  # a day with reads is filled from 00:00
+    assert days.count(12) == 2  # and never past the last read
+    assert [r.consumption for r in out if r.start_time.date().day == 10][3] == 1.0

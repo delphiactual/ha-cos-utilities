@@ -100,3 +100,53 @@ async def test_reconcile_never_fills_past_the_last_real_electric_read(mod):
     filled = mod.csu.reconcile_hourly_with_daily(hourly, daily)
 
     assert max(r.start_time for r in filled) == max(r.start_time for r in hourly)
+
+
+def _local(mod, *args):
+    return datetime(*args, tzinfo=mod.csu.LOCAL_TZ)
+
+
+def _days(reads):
+    days = {}
+    for r in reads:
+        days.setdefault(r.start_time.date().isoformat(), []).append(r)
+    return days
+
+
+async def test_gas_live_update_writes_the_days_that_are_posted(mod):
+    # The window that ends at the capture is empty for gas, because the last day
+    # is not posted yet. The reads before it still come back.
+    api, meter = await _api(mod, "GAS")
+
+    reads = await api.async_get_recent_hourly(
+        meter, _local(mod, 2026, 11, 18), _local(mod, 2026, 11, 25)
+    )
+
+    days = _days(reads)
+    assert sorted(days) == [f"2026-11-{d}" for d in range(18, 23)]
+    # Every hour is filled, up to the last real read (labelled 23:00, so 22:00).
+    assert [len(days[d]) for d in sorted(days)] == [24, 24, 24, 24, 23]
+
+
+async def test_electric_with_empty_windows_in_the_middle_keeps_both_sides(mod):
+    # Windows nobody recorded answer "no data", like a failed or empty week.
+    api = mod.CSU(FixtureSession(empty_outside=True), "user", "pass")
+    await api.async_login()
+    await api.async_get_meters()
+    meter = next(m for m in api.meters if m.meter_type.name == "ELEC")
+
+    reads = await api.async_get_recent_hourly(
+        meter, _local(mod, 2026, 10, 25), _local(mod, 2026, 11, 25)
+    )
+
+    days = _days(reads)
+    # The week ending 11-04 includes all of 11-04.
+    kept = {f"2026-10-{d}" for d in range(28, 32)} | {
+        f"2026-11-{d:02d}" for d in (1, 2, 3, 4)
+    }
+    recent = {f"2026-11-{d}" for d in range(18, 24)}
+    assert set(days) == kept | recent  # no rows for the empty weeks between
+    for day in kept | recent:
+        expected = 25 if day == "2026-11-01" else 24
+        if day != "2026-11-23":  # the last day stops at the last real read
+            assert len(days[day]) == expected, day

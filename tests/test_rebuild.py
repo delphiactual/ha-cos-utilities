@@ -102,6 +102,11 @@ class FakeCsu:
         self.partial = 0
         # Days that have a gas read in hour 0; None means every day does.
         self.gas_midnight_days = None
+        # Gas is posted late: no reads in its last gas_lag hours.
+        self.gas_lag = 0
+        # Fake days whose hourly window comes back empty in a regular update
+        # (a 500 reads as an empty window).
+        self.hole_days = set()
         self.water_hour_calls = 0
         self.water_day_spans = []
         self.elec = _meter(1, MeterType.ELEC, ReadResolution.QUARTER_HOUR)
@@ -173,7 +178,7 @@ class FakeCsu:
                 end_time=self.base + (i + 1) * HOUR,
                 consumption=GAS_PER_HOUR,
             )
-            for i in range(self.hours)
+            for i in range(self.hours - self.gas_lag)
             if self.gas_has_read(i)
         ]
 
@@ -209,6 +214,12 @@ class FakeCsu:
             reads = self.gas_hourly() if hourly else self.gas_daily()
         else:
             reads = self.hourly() if hourly else self.daily()
+        if hourly and not kwargs.get("strict"):
+            reads = [
+                r
+                for r in reads
+                if (r.start_time - self.base).days not in self.hole_days
+            ]
         if kwargs.get("strict"):
             # A full-history fetch ignores the range, like the real walk does.
             if hourly:
@@ -719,3 +730,48 @@ async def test_the_regular_update_keeps_the_gas_chain_unbroken(
     assert rows[-1]["sum"] == pytest.approx(
         rebuilt[-1]["sum"] + new_reads * GAS_PER_HOUR
     )
+
+
+async def test_a_failed_window_in_the_middle_keeps_its_hours_and_the_chain(
+    recorder_mock, enable_custom_integrations, hass, entry, fake, patched_api
+):
+    coordinator = await _setup(hass, entry)
+    rebuilt = await _rows(hass, IMPORT_ID)
+    rebuilt_gas = await _rows(hass, GAS_ID)
+
+    fake.hole_days = {fake.hours // 24 - 10}  # inside the update window
+    for _ in range(2):
+        await coordinator._insert_statistics()
+        await get_instance(hass).async_block_till_done()
+
+        rows = await _rows(hass, IMPORT_ID)
+        # Hours of the skipped day keep their stored state, and the sums add up
+        # across both of its edges.
+        _check_history(fake, rows, "state")
+        assert [r["state"] for r in rows] == pytest.approx(
+            [r["state"] for r in rebuilt]
+        )
+        assert [r["sum"] for r in rows] == pytest.approx([r["sum"] for r in rebuilt])
+        gas = await _rows(hass, GAS_ID)
+        assert [r["sum"] for r in gas] == pytest.approx([r["sum"] for r in rebuilt_gas])
+
+
+async def test_gas_that_is_not_posted_yet_still_updates_what_is(
+    recorder_mock, enable_custom_integrations, hass, entry, fake, patched_api
+):
+    fake.gas_lag = 30  # the last day and a bit has no gas reads yet
+    coordinator = await _setup(hass, entry)
+    _check_gas_chain(fake, await _rows(hass, GAS_ID))
+
+    fake.gas_lag = 6  # most of it is posted by the next update
+    await coordinator._insert_statistics()
+    await get_instance(hass).async_block_till_done()
+
+    rows = await _rows(hass, GAS_ID)
+    _check_gas_chain(fake, rows)
+    assert max(_by_hour(fake, rows)) >= fake.hours - 6 - 24
+
+    fake.gas_lag = 30  # a later update that sees less must not zero or move anything
+    await coordinator._insert_statistics()
+    await get_instance(hass).async_block_till_done()
+    _check_gas_chain(fake, await _rows(hass, GAS_ID))

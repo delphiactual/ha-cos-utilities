@@ -193,12 +193,13 @@ def reconcile_hourly_with_daily(
 def dense_hourly_reads(
     meter: Meter, reads: list[UsageRead], window_start: datetime
 ) -> list[UsageRead]:
-    """One read per hour from window_start to the last real read, zero where none.
+    """One read per hour of every day that has a real read, zero where none.
 
-    An hour CSU gives no read for is an hour without usage. Writing it as zero lets
-    it replace whatever sum an earlier write left on that hour, so no hour in the
-    window can keep a sum from a different chain. Nothing is added after the last
-    real read, so hours that have not been read yet stay untouched.
+    Inside a day CSU did report on, a missing hour is an hour without usage, and
+    writing zero lets it replace whatever sum an earlier write left there. A day
+    with no read at all means no data yet (or a failed request), not zero usage,
+    so it gets no rows and what is stored for it stays. Nothing is added after the
+    last real read, so hours that have not been read yet stay untouched.
     """
     by_hour = {
         r.start_time.astimezone(timezone.utc): r
@@ -207,23 +208,34 @@ def dense_hourly_reads(
     }
     if not by_hour:
         return []
-    # Step in UTC: wall-clock arithmetic is wrong across DST changes.
-    current = window_start.astimezone(timezone.utc)
+    zone = window_start.tzinfo
     last = max(by_hour)
+    days = sorted({r.start_time.astimezone(zone).date() for r in by_hour.values()})
     dense = []
-    while current <= last:
-        read = by_hour.get(current)
-        if read is None:
-            start = current.astimezone(LOCAL_TZ)
-            read = UsageRead(
-                meter=meter,
-                start_time=start,
-                end_time=start + timedelta(hours=1),
-                consumption=0.0,
-            )
-        dense.append(read)
-        current += timedelta(hours=1)
+    for day in days:
+        # Step in UTC: wall-clock arithmetic is wrong across DST changes.
+        current = datetime.combine(day, datetime.min.time(), tzinfo=zone).astimezone(
+            timezone.utc
+        )
+        following = datetime.combine(
+            day + timedelta(days=1), datetime.min.time(), tzinfo=zone
+        ).astimezone(timezone.utc)
+        while current < following and current <= last:
+            read = by_hour.get(current)
+            if read is None:
+                start = current.astimezone(LOCAL_TZ)
+                read = UsageRead(
+                    meter=meter,
+                    start_time=start,
+                    end_time=start + timedelta(hours=1),
+                    consumption=0.0,
+                )
+            dense.append(read)
+            current += timedelta(hours=1)
     return dense
+
+
+HOURLY_WINDOW_DAYS = 7
 
 
 class CSU:
@@ -499,7 +511,7 @@ class CSU:
         window_days: int | None = None,
         strict: bool = False,
         retry_delays: tuple[float, ...] = RETRY_DELAYS,
-        stop_after_empty: int = 1,
+        stop_after_empty: int | None = 1,
     ) -> list[UsageRead]:
         """Get usage reads for a meter.
 
@@ -576,6 +588,39 @@ class CSU:
             )
         return result
 
+    async def async_get_recent_hourly(
+        self,
+        meter: Meter,
+        start: datetime,
+        end: datetime,
+        daily_reads: list[UsageRead] | None = None,
+    ) -> list[UsageRead]:
+        """Hourly reads from the local midnight of start, dense per day with data.
+
+        Walks the whole range in weekly windows without stopping at an empty one:
+        CSU posts gas a day or two late, and an empty or failed window in the
+        middle only means no reads there. Days without reads are left out.
+        """
+        reads = await self.async_get_usage_reads(
+            meter,
+            AggregateType.HOUR,
+            start,
+            end,
+            window_days=HOURLY_WINDOW_DAYS,
+            stop_after_empty=None,
+        )
+        if not reads:
+            return []
+        if meter.meter_type == MeterType.ELEC and daily_reads:
+            # Only days inside the hourly range.
+            reads = reconcile_hourly_with_daily(
+                reads, [r for r in daily_reads if r.start_time.date() >= start.date()]
+            )
+        window_start = datetime.combine(
+            start.date(), datetime.min.time(), tzinfo=start.tzinfo
+        )
+        return dense_hourly_reads(meter, reads, window_start)
+
     async def async_get_dated_data(
         self,
         meter: Meter,
@@ -586,7 +631,7 @@ class CSU:
         window_days: int | None = None,
         strict: bool = False,
         retry_delays: tuple[float, ...] = RETRY_DELAYS,
-        stop_after_empty: int = 1,
+        stop_after_empty: int | None = 1,
     ) -> list[Any]:
         """Break large _async_fetch requests into smaller batches."""
 
@@ -631,7 +676,7 @@ class CSU:
                 result = reads + result
             else:
                 empty_in_a_row += 1
-                if empty_in_a_row >= stop_after_empty:
+                if stop_after_empty and empty_in_a_row >= stop_after_empty:
                     return result
             req_end = req_end - timedelta(days=max_request_days)
 
