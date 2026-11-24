@@ -747,7 +747,7 @@ async def test_a_failed_window_in_the_middle_keeps_its_hours_and_the_chain(
         rows = await _rows(hass, IMPORT_ID)
         # Hours of the skipped day keep their stored state, and the sums add up
         # across both of its edges.
-        _check_history(fake, rows, "state")
+        _check_history(fake, rows, "consumption")
         assert [r["state"] for r in rows] == pytest.approx(
             [r["state"] for r in rebuilt]
         )
