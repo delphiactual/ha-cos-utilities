@@ -219,17 +219,12 @@ class FakeCsu:
                 if self.fail_deep:
                     raise CannotConnect("fake outage")
             return reads
-        # The real endpoint works in whole local days.
-        if hourly:
-            first, last = start.date(), end.date()
-            return [
-                r
-                for r in reads
-                if first <= r.start_time.astimezone(LOCAL_TZ).date() <= last
-            ]
-        first = start.astimezone(UTC).date()
-        last = end.astimezone(UTC).date()
-        return [r for r in reads if first <= r.start_time.date() <= last]
+        # The real endpoint works in whole days of the requested time zone.
+        zone = start.tzinfo
+        first, last = start.date(), end.date()
+        return [
+            r for r in reads if first <= r.start_time.astimezone(zone).date() <= last
+        ]
 
 
 @pytest.fixture
@@ -262,6 +257,9 @@ def patched_api(fake):
         return True
 
     with (
+        # The fake's days are UTC days. The real window starts at a local midnight,
+        # which is also where real days start, so run the integration in UTC here.
+        patch("custom_components.csu.coordinator.TIME_ZONE", "UTC"),
         patch.object(CSU, "async_login", autospec=True, side_effect=login),
         patch.object(CSU, "async_get_meters", autospec=True, side_effect=meters),
         patch.object(CSU, "async_get_bill_history", autospec=True, side_effect=bills),
