@@ -100,6 +100,8 @@ class FakeCsu:
         self.deep_empty = []
         # Hours read so far on a last day whose daily total is still partial.
         self.partial = 0
+        # Days that have a gas read in hour 0; None means every day does.
+        self.gas_midnight_days = None
         self.water_hour_calls = 0
         self.water_day_spans = []
         self.elec = _meter(1, MeterType.ELEC, ReadResolution.QUARTER_HOUR)
@@ -152,16 +154,27 @@ class FakeCsu:
             )
         return reads
 
+    def gas_has_read(self, i):
+        """Real gas has reads in a few hours only, and hour 0 on some days only."""
+        hour = i % 24
+        if hour not in GAS_HOURS:
+            return False
+        return (
+            hour != 0
+            or self.gas_midnight_days is None
+            or i // 24 in self.gas_midnight_days
+        )
+
     def gas_hourly(self):
         return [
             UsageRead(
                 meter=self.gas,
-                start_time=self.base + timedelta(days=day, hours=hour),
-                end_time=self.base + timedelta(days=day, hours=hour + 1),
+                start_time=self.base + i * HOUR,
+                end_time=self.base + (i + 1) * HOUR,
                 consumption=GAS_PER_HOUR,
             )
-            for day in range(self.hours // 24)
-            for hour in GAS_HOURS
+            for i in range(self.hours)
+            if self.gas_has_read(i)
         ]
 
     def gas_daily(self):
@@ -588,18 +601,40 @@ async def test_a_new_release_gets_fresh_rebuild_tries(
     assert fake.deep_calls[MeterType.ELEC] == 1
 
 
-async def test_electric_rebuilt_by_0_3_0_or_0_3_1_is_redone_but_gas_is_kept(
-    recorder_mock, enable_custom_integrations, hass, fake, patched_api
+@pytest.mark.parametrize("stored", [None, "0.3.0", "0.3.2"])
+async def test_series_rebuilt_by_a_release_before_0_3_3_are_rebuilt_again(
+    recorder_mock, enable_custom_integrations, hass, fake, patched_api, stored
 ):
-    # No stored version means the flags came from 0.3.0 or 0.3.1, whose electric
-    # walk used windows that were too long to be complete.
-    entry = _entry(hass, **{CONF_HOURLY_REBUILD_DONE: [IMPORT_ID, EXPORT_ID, GAS_ID]})
+    # No stored version means the flags came from 0.3.0 or 0.3.1. Every release
+    # before 0.3.3 left a broken sum chain from its regular update.
+    extra = {CONF_HOURLY_REBUILD_DONE: [IMPORT_ID, EXPORT_ID, GAS_ID]}
+    if stored:
+        extra[CONF_HOURLY_REBUILD_VERSION] = stored
+    entry = _entry(hass, **extra)
 
     await _setup(hass, entry)
 
     assert fake.deep_calls[MeterType.ELEC] == 1
-    assert fake.deep_calls[MeterType.GAS] == 0
+    assert fake.deep_calls[MeterType.GAS] == 1
     assert set(entry.data[CONF_HOURLY_REBUILD_DONE]) == {IMPORT_ID, EXPORT_ID, GAS_ID}
+
+
+async def test_series_rebuilt_by_this_release_are_left_alone(
+    recorder_mock, enable_custom_integrations, hass, fake, patched_api
+):
+    version = str((await async_get_integration(hass, DOMAIN)).version)
+    entry = _entry(
+        hass,
+        **{
+            CONF_HOURLY_REBUILD_VERSION: version,
+            CONF_HOURLY_REBUILD_DONE: [IMPORT_ID, EXPORT_ID, GAS_ID],
+        },
+    )
+
+    await _setup(hass, entry)
+
+    assert fake.deep_calls[MeterType.ELEC] == 0
+    assert fake.deep_calls[MeterType.GAS] == 0
 
 
 async def test_rebuild_never_fills_hours_that_have_not_happened(
@@ -634,3 +669,48 @@ async def test_rebuild_never_fills_hours_that_have_not_happened(
             assert by_hour[i]["state"] == pytest.approx(_truth("consumption", i))
     assert [r["sum"] for r in rows[: len(rebuilt)]] == pytest.approx(rebuilt)
     _check_chain(rows)
+
+
+def _check_gas_chain(fake, rows):
+    """Dense hourly rows, each with its own read (never a day's total), no jumps."""
+    by_hour = _by_hour(fake, rows)
+    first, last = min(by_hour), max(by_hour)
+    assert sorted(by_hour) == list(range(first, last + 1))
+    for i in range(first, last + 1):
+        expected = GAS_PER_HOUR if fake.gas_has_read(i) else 0.0
+        assert by_hour[i]["state"] == pytest.approx(expected), f"hour {i}"
+        if i > first:
+            delta = by_hour[i]["sum"] - by_hour[i - 1]["sum"]
+            assert delta >= 0, f"hour {i} goes backwards"
+            assert delta == pytest.approx(by_hour[i]["state"]), f"hour {i}"
+
+
+async def test_the_regular_update_keeps_the_gas_chain_unbroken(
+    recorder_mock, enable_custom_integrations, hass, entry, fake, patched_api
+):
+    # Real gas has a read in a few hours only, and in hour 0 on some days only, so
+    # the first days of the update window have no read where the daily row starts.
+    fake.gas_midnight_days = {20, 33}
+
+    coordinator = await _setup(hass, entry)
+
+    rebuilt = await _rows(hass, GAS_ID)
+    _check_gas_chain(fake, rebuilt)
+    for _ in range(2):  # the same window rewritten again changes nothing
+        await coordinator._insert_statistics()
+        await get_instance(hass).async_block_till_done()
+        rows = await _rows(hass, GAS_ID)
+        _check_gas_chain(fake, rows)
+        assert [r["sum"] for r in rows] == pytest.approx([r["sum"] for r in rebuilt])
+
+    # A new day of reads carries on from the same chain.
+    fake.hours += 24
+    await coordinator._insert_statistics()
+    await get_instance(hass).async_block_till_done()
+
+    rows = await _rows(hass, GAS_ID)
+    _check_gas_chain(fake, rows)
+    new_reads = sum(fake.gas_has_read(i) for i in range(fake.hours - 24, fake.hours))
+    assert rows[-1]["sum"] == pytest.approx(
+        rebuilt[-1]["sum"] + new_reads * GAS_PER_HOUR
+    )

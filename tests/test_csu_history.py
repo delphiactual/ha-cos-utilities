@@ -354,3 +354,49 @@ async def test_the_empty_count_starts_over_after_a_window_with_reads(
     # Single empty windows never add up; only two in a row end the walk.
     assert len(reads) == 2
     assert session.calls[HOURLY_URL] == 6
+
+
+def test_dense_hourly_reads_give_every_hour_a_row_and_stop_at_the_last_read(mod, meter):
+    window = _day(mod, 2026, 5, 10)
+    reads = [
+        _read(mod, meter, window + timedelta(hours=h), imp=1.0, exp=0.5) for h in (3, 5)
+    ]
+
+    out = mod.csu.dense_hourly_reads(meter, reads, window)
+
+    # The window starts at 00:00 even though nothing was read until 03:00, and
+    # nothing is added after the last read.
+    assert [r.start_time.hour for r in out] == [0, 1, 2, 3, 4, 5]
+    assert [r.consumption for r in out] == [0.0, 0.0, 0.0, 1.0, 0.0, 1.0]
+    assert [r.received for r in out] == [0.0, 0.0, 0.0, 0.5, 0.0, 0.5]
+    assert out[3] is reads[0]  # real reads are passed through untouched
+
+
+def test_dense_hourly_reads_of_nothing_is_nothing(mod, meter):
+    assert mod.csu.dense_hourly_reads(meter, [], _day(mod, 2026, 5, 10)) == []
+
+
+def test_dense_hourly_reads_ignore_reads_before_the_window(mod, meter):
+    window = _day(mod, 2026, 5, 10)
+    reads = [
+        _read(mod, meter, window - timedelta(hours=1), imp=9.0),
+        _read(mod, meter, window + timedelta(hours=1), imp=1.0),
+    ]
+
+    out = mod.csu.dense_hourly_reads(meter, reads, window)
+
+    assert [(r.start_time.hour, r.consumption) for r in out] == [(0, 0.0), (1, 1.0)]
+
+
+@pytest.mark.parametrize(
+    "day, last_hour, rows",
+    [((2026, 3, 8), 22, 22), ((2026, 11, 1), 23, 25), ((2026, 6, 1), 23, 24)],
+)
+def test_dense_hourly_reads_step_through_dst_changes(mod, meter, day, last_hour, rows):
+    window = _day(mod, *day)
+    reads = [_read(mod, meter, window + timedelta(hours=last_hour), imp=1.0)]
+
+    out = mod.csu.dense_hourly_reads(meter, reads, window)
+
+    assert len(out) == rows
+    assert len({r.start_time.astimezone(timezone.utc) for r in out}) == rows

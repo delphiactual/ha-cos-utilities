@@ -37,7 +37,9 @@ Only electric is filled. Gas hourly data was checked against the live account: t
 
 Upgrading from 0.2.x does a one-time rebuild of the electric and gas statistics in the background after startup. Each series is fetched in full, its sums are recomputed from zero and it is written in a single step, replacing the old one-row-per-day entries for older periods. Because of that, older periods in the Energy dashboard will change. If anything fails (an outage, an expired login), nothing is written and the rebuild is retried the next time Home Assistant starts. It never asks you to sign in again.
 
-If Home Assistant already holds a few hours of live data past the end of the fetched history (CSU's data lags), those rows are kept and their sums continue from the rebuilt ones in the same write. If a series can never be rebuilt safely (for example it has rows before the oldest fetched hour), the log says which times were involved, and after 3 starts it stops trying and keeps the existing history. A new release gets a fresh 3 tries, and electric statistics rebuilt by 0.3.0 or 0.3.1 are rebuilt again.
+If Home Assistant already holds a few hours of live data past the end of the fetched history (CSU's data lags), those rows are kept and their sums continue from the rebuilt ones in the same write. If a series can never be rebuilt safely (for example it has rows before the oldest fetched hour), the log says which times were involved, and after 3 starts it stops trying and keeps the existing history. A new release gets a fresh 3 tries, and statistics rebuilt by 0.3.0, 0.3.1 or 0.3.2 are rebuilt again, because the regular update of those releases wrote a broken sum chain.
+
+The regular update rewrites the last 2 months hour by hour, starting from the row before that window. Hours CSU has no read for are written as zero, so every hour in the window gets a row, and daily totals are never written on top of hours that have hourly reads.
 
 ## Smoke test
 

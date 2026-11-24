@@ -190,6 +190,42 @@ def reconcile_hourly_with_daily(
     ]
 
 
+def dense_hourly_reads(
+    meter: Meter, reads: list[UsageRead], window_start: datetime
+) -> list[UsageRead]:
+    """One read per hour from window_start to the last real read, zero where none.
+
+    An hour CSU gives no read for is an hour without usage. Writing it as zero lets
+    it replace whatever sum an earlier write left on that hour, so no hour in the
+    window can keep a sum from a different chain. Nothing is added after the last
+    real read, so hours that have not been read yet stay untouched.
+    """
+    by_hour = {
+        r.start_time.astimezone(timezone.utc): r
+        for r in reads
+        if r.start_time >= window_start
+    }
+    if not by_hour:
+        return []
+    # Step in UTC: wall-clock arithmetic is wrong across DST changes.
+    current = window_start.astimezone(timezone.utc)
+    last = max(by_hour)
+    dense = []
+    while current <= last:
+        read = by_hour.get(current)
+        if read is None:
+            start = current.astimezone(LOCAL_TZ)
+            read = UsageRead(
+                meter=meter,
+                start_time=start,
+                end_time=start + timedelta(hours=1),
+                consumption=0.0,
+            )
+        dense.append(read)
+        current += timedelta(hours=1)
+    return dense
+
+
 class CSU:
     """Class that can get historical usage/cost from Colorado Springs Utilities."""
 

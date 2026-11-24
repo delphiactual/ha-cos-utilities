@@ -2,6 +2,7 @@
 
 import logging
 from datetime import datetime
+from datetime import time
 from datetime import timedelta
 from datetime import timezone
 from typing import Any
@@ -41,6 +42,7 @@ from .const import DOMAIN
 from .const import TIME_ZONE
 from .csu import AggregateType
 from .csu import CSU
+from .csu import dense_hourly_reads
 from .csu import LOCAL_TZ
 from .csu import Meter
 from .csu import MeterType
@@ -71,6 +73,9 @@ REBUILD_MAX_REFUSALS = 3
 # Existing rows this far past the walk's last point are data lag; more means
 # the walk fell short.
 REBUILD_MAX_TAIL = timedelta(hours=48)
+# Releases before this wrote a broken sum chain in the regular update, so
+# their rebuilt series are rebuilt once more.
+CHAIN_FIXED_IN = (0, 3, 3)
 
 
 class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
@@ -234,19 +239,27 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
                 await self._insert_series(meter, id_prefix, suffix, attr, label)
 
     async def _async_sync_rebuild_version(self) -> None:
-        """Give a new release fresh rebuild tries, and redo electric from old ones."""
+        """Give a new release fresh rebuild tries, and redo series from old ones."""
         version = str((await async_get_integration(self.hass, DOMAIN)).version)
         data = self.config_entry.data
-        if data.get(CONF_HOURLY_REBUILD_VERSION) == version:
+        stored = data.get(CONF_HOURLY_REBUILD_VERSION)
+        if stored == version:
             return
         updated = {**data, CONF_HOURLY_REBUILD_VERSION: version}
         updated.pop(CONF_HOURLY_REBUILD_REFUSED, None)
-        if CONF_HOURLY_REBUILD_VERSION not in data and CONF_HOURLY_REBUILD_DONE in data:
-            # 0.3.0 and 0.3.1 fetched electric in windows too long to be complete.
-            updated[CONF_HOURLY_REBUILD_DONE] = [
-                sid for sid in data[CONF_HOURLY_REBUILD_DONE] if "_elec_" not in sid
-            ]
+        if CONF_HOURLY_REBUILD_DONE in data and (
+            stored is None or self._version_tuple(stored) < CHAIN_FIXED_IN
+        ):
+            # Older releases left broken sums (and incomplete electric history).
+            updated[CONF_HOURLY_REBUILD_DONE] = []
         self.hass.config_entries.async_update_entry(self.config_entry, data=updated)
+
+    @staticmethod
+    def _version_tuple(text: str) -> tuple[int, ...]:
+        try:
+            return tuple(int(part) for part in str(text).split(".")[:3])
+        except ValueError:
+            return ()  # unknown counts as older than any release
 
     def _pending_rebuild(self, id_prefix, series) -> dict:
         """Series not yet rebuilt and not already tried since this start."""
@@ -414,17 +427,7 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
                 self._local(oldest),
             )
             return None
-        after = await recorder.async_add_executor_job(
-            statistics_during_period,
-            self.hass,
-            last + timedelta(hours=1),
-            None,
-            {statistic_id},
-            "hour",
-            None,
-            {"state"},
-        )
-        tail = after.get(statistic_id, [])
+        tail = await self._rows_after(statistic_id, last)
         if not tail:
             return points
         newest = datetime.fromtimestamp(tail[-1]["start"], tz=timezone.utc)
@@ -437,18 +440,7 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
                 self._local(newest),
             )
             return None
-        running_sum = points[-1]["sum"]
-        carried = []
-        for row in tail:
-            state = row["state"] or 0.0
-            running_sum += state
-            carried.append(
-                StatisticData(
-                    start=datetime.fromtimestamp(row["start"], tz=timezone.utc),
-                    state=state,
-                    sum=running_sum,
-                )
-            )
+        carried = self._chain_rows(tail, points[-1]["sum"])
         _LOGGER.info(
             "%s: carrying %d existing rows after %s into the rebuild",
             statistic_id,
@@ -456,6 +448,57 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             self._local(last),
         )
         return points + carried
+
+    async def _rows_after(self, statistic_id: str, last: datetime) -> list[dict]:
+        """Existing rows after the hour `last`, with their states."""
+        after = await get_instance(self.hass).async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            last + timedelta(hours=1),
+            None,
+            {statistic_id},
+            "hour",
+            None,
+            {"state"},
+        )
+        return after.get(statistic_id, [])
+
+    @staticmethod
+    def _chain_rows(rows: list[dict], running_sum: float) -> list[StatisticData]:
+        """Keep each row's own state and sum them on from running_sum."""
+        chained = []
+        for row in rows:
+            state = row["state"] or 0.0
+            running_sum += state
+            chained.append(
+                StatisticData(
+                    start=datetime.fromtimestamp(row["start"], tz=timezone.utc),
+                    state=state,
+                    sum=running_sum,
+                )
+            )
+        return chained
+
+    async def _sum_before(self, statistic_id: str, first: datetime) -> float:
+        """The sum of the last row before `first`, or 0 when there is none."""
+        first = first.astimezone(timezone.utc)
+        for since in (
+            first - timedelta(days=7),
+            datetime.fromtimestamp(0, tz=timezone.utc),
+        ):
+            rows = await get_instance(self.hass).async_add_executor_job(
+                statistics_during_period,
+                self.hass,
+                since,
+                first,
+                {statistic_id},
+                "hour",
+                None,
+                {"sum"},
+            )
+            if rows.get(statistic_id):
+                return cast(float, rows[statistic_id][-1]["sum"])
+        return 0.0
 
     def _count_refusal(self, statistic_id: str) -> None:
         """Remember a refusal so a series that can never rebuild stops retrying."""
@@ -515,37 +558,29 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             _LOGGER.info("Updating statistics for the first time: %s", statistic_id)
             usage_reads = await self._cached_reads(meter, None)
             running_sum = 0.0
-            last_stats_time = None
         else:
             usage_reads = await self._cached_reads(
                 meter, last_stat[statistic_id][0]["start"]
             )
             if not usage_reads:
                 return
-            stats = await get_instance(self.hass).async_add_executor_job(
-                statistics_during_period,
-                self.hass,
-                usage_reads[0].start_time,
-                None,
-                {statistic_id},
-                "hour",
-                None,
-                {"sum"},
+            # Anchor on a row outside the window being rewritten, so every row in
+            # it is replaced and none keeps a sum from another chain.
+            running_sum = await self._sum_before(
+                statistic_id, usage_reads[0].start_time
             )
-            if stats.get(statistic_id):
-                running_sum = cast(float, stats[statistic_id][0]["sum"])
-                last_stats_time = stats[statistic_id][0]["start"]
-            else:
-                running_sum = cast(float, last_stat[statistic_id][0]["sum"])
-                last_stats_time = last_stat[statistic_id][0]["start"]
         points = []
         for usage_read in usage_reads:
-            start = usage_read.start_time
-            if last_stats_time is not None and start.timestamp() <= last_stats_time:
-                continue
             value = getattr(usage_read, attr)
             running_sum += value
-            points.append(StatisticData(start=start, state=value, sum=running_sum))
+            points.append(
+                StatisticData(start=usage_read.start_time, state=value, sum=running_sum)
+            )
+        if last_stat and points:
+            # Rows already past the last hour read stay, summed on from this chain.
+            points += self._chain_rows(
+                await self._rows_after(statistic_id, points[-1]["start"]), running_sum
+            )
         metadata = self._statistic_metadata(meter, statistic_id, label)
         if not valid_statistic_id(statistic_id):
             _LOGGER.warning("Invalid statistic id: %s", statistic_id)
@@ -580,35 +615,16 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
     async def _async_get_usage_reads(
         self, meter: Meter, time_zone_str: str, start_time: float | None = None
     ) -> list[UsageRead]:
-        """Get usage reads.
+        """Get usage reads, oldest first, never two reads for the same hour.
 
-        If start_time is None, get usage reads since account activation, otherwise since start_time - 30 days to allow corrections in data from utilities.
+        If start_time is None, get usage reads since account activation, otherwise
+        since start_time - 30 days to allow corrections in data from utilities.
 
-        We read at different resolutions depending on age:
-        - day resolution for the past 2 years (all the daily endpoint keeps)
-        - hour resolution for past 2 months
+        Hourly meters get hourly reads for the past 2 months, one per hour with zero
+        for hours CSU has no read for. Daily reads only cover days before that
+        window, and only on a first import: inside it, or on top of an hourly
+        history, a daily total would overwrite hours that already have real reads.
         """
-
-        def _update_with_finer_usage_reads(
-            usage_reads: list[UsageRead], finer_usage_reads: list[UsageRead]
-        ) -> None:
-            for i, usage_read in enumerate(usage_reads):
-                for j, finer_usage_read in enumerate(finer_usage_reads):
-                    _LOGGER.debug(
-                        "Read end time is %s and fine read start time is %s",
-                        usage_read.end_time,
-                        finer_usage_read.start_time,
-                    )
-                    if usage_read.start_time == finer_usage_read.start_time:
-                        usage_reads[i:] = finer_usage_reads[j:]
-                        return
-                    if usage_read.end_time == finer_usage_read.start_time:
-                        usage_reads[i + 1 :] = finer_usage_reads[j:]
-                        return
-                    if usage_read.end_time < finer_usage_read.start_time:
-                        break
-            usage_reads += finer_usage_reads
-
         tz = await dt_util.async_get_time_zone(time_zone_str)
         end = dt_util.now(tz)
         if start_time is None:
@@ -627,7 +643,6 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         if start_time is None:
             start = end - timedelta(days=2 * 30)
         else:
-            assert start
             start = max(start, end - timedelta(days=2 * 30))
         _LOGGER.debug(
             "Meter is hourly. Getting finer data stats for %s until %s", start, end
@@ -635,16 +650,20 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         hourly_usage_reads = await self.api.async_get_usage_reads(
             meter, AggregateType.HOUR, start, end
         )
+        if not hourly_usage_reads:
+            # Nothing hourly to write; a first import still gets the daily history.
+            return usage_reads if start_time is None else []
         # Only days inside the hourly window; older days stay daily.
         if meter.meter_type == MeterType.ELEC:
             hourly_usage_reads = reconcile_hourly_with_daily(
                 hourly_usage_reads,
                 [r for r in usage_reads if r.start_time.date() >= start.date()],
             )
-        _update_with_finer_usage_reads(usage_reads, hourly_usage_reads)
-        return usage_reads
-
-        # add in additional update for quarter-hour reads?
+        window_start = datetime.combine(start.date(), time.min, tzinfo=tz)
+        hourly = dense_hourly_reads(meter, hourly_usage_reads, window_start)
+        if start_time is not None:
+            return hourly
+        return [r for r in usage_reads if r.end_time <= window_start] + hourly
 
 
 type CsuConfigEntry = ConfigEntry[CsuCoordinator]
