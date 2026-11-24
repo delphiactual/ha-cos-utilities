@@ -10,3 +10,5 @@ TIME_ZONE = "America/Denver"
 CONF_HOURLY_REBUILD_DONE = "hourly_rebuild_done"
 # statistic id -> starts where the rebuild was refused or found no history
 CONF_HOURLY_REBUILD_REFUSED = "hourly_rebuild_refused"
+# Release that last touched the rebuild state, so a new release gets fresh tries
+CONF_HOURLY_REBUILD_VERSION = "hourly_rebuild_version"

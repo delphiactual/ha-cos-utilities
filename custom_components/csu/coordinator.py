@@ -28,17 +28,20 @@ from homeassistant.exceptions import ConfigEntryAuthFailed  # type: ignore
 from homeassistant.helpers import aiohttp_client  # type: ignore
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator  # type: ignore
 from homeassistant.helpers.update_coordinator import UpdateFailed  # type: ignore
+from homeassistant.loader import async_get_integration  # type: ignore
 from homeassistant.util import dt as dt_util  # type: ignore
 
 from .const import CONF_ACCESS_TOKEN
 from .const import CONF_CUSTOMER_ID
 from .const import CONF_HOURLY_REBUILD_DONE
 from .const import CONF_HOURLY_REBUILD_REFUSED
+from .const import CONF_HOURLY_REBUILD_VERSION
 from .const import CONF_TOKEN_EXPIRES_AT
 from .const import DOMAIN
 from .const import TIME_ZONE
 from .csu import AggregateType
 from .csu import CSU
+from .csu import LOCAL_TZ
 from .csu import Meter
 from .csu import MeterType
 from .csu import ReadResolution
@@ -52,15 +55,19 @@ _LOGGER = logging.getLogger(__name__)
 
 # The daily endpoint only keeps a rolling two years; older days come back empty.
 DAILY_HISTORY = timedelta(days=730)
-# The interval endpoint reaches back to service start. Walk in month-sized windows
-# and stop at the first empty one; the cap only guards against a runaway loop.
-HOURLY_WINDOW_DAYS = 30
+# The interval endpoint reaches back to service start. Walk it and stop at the
+# first empty window; the cap only guards against a runaway loop. Long ranges come
+# back with missing reads and a stale tail, so the windows must stay short.
+HOURLY_WINDOW_DAYS = 7
 HOURLY_MAX_HISTORY = timedelta(days=3650)
 # One token must outlast the whole rebuild, because the server has no refresh
 # and a new login could ask for an MFA code.
 REBUILD_TOKEN_MARGIN = 40 * 60
 # A series whose history can never be rebuilt safely stops being retried.
 REBUILD_MAX_REFUSALS = 3
+# Existing rows this far past the walk's last point are data lag; more means
+# the walk fell short.
+REBUILD_MAX_TAIL = timedelta(hours=48)
 
 
 class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
@@ -195,6 +202,7 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         """Insert CSU statistics; net-metered electric also gets an export series."""
         if not self.api.meters:
             await self.api.async_get_meters()
+        await self._async_sync_rebuild_version()
         token_ready = False
         for meter in self.api.meters:
             id_prefix = (
@@ -221,6 +229,21 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
                     await self._async_rebuild_hourly(meter, id_prefix, series)
             for suffix, attr, label in series:
                 await self._insert_series(meter, id_prefix, suffix, attr, label)
+
+    async def _async_sync_rebuild_version(self) -> None:
+        """Give a new release fresh rebuild tries, and redo electric from old ones."""
+        version = str((await async_get_integration(self.hass, DOMAIN)).version)
+        data = self.config_entry.data
+        if data.get(CONF_HOURLY_REBUILD_VERSION) == version:
+            return
+        updated = {**data, CONF_HOURLY_REBUILD_VERSION: version}
+        updated.pop(CONF_HOURLY_REBUILD_REFUSED, None)
+        if CONF_HOURLY_REBUILD_VERSION not in data and CONF_HOURLY_REBUILD_DONE in data:
+            # 0.3.0 and 0.3.1 fetched electric in windows too long to be complete.
+            updated[CONF_HOURLY_REBUILD_DONE] = [
+                sid for sid in data[CONF_HOURLY_REBUILD_DONE] if "_elec_" not in sid
+            ]
+        self.hass.config_entries.async_update_entry(self.config_entry, data=updated)
 
     def _pending_rebuild(self, id_prefix, series) -> dict:
         """Series not yet rebuilt and not already tried since this start."""
@@ -266,18 +289,20 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
         self._rebuild_attempted.update(pending)
         if not pending:
             return
-        end = dt_util.now(await dt_util.async_get_time_zone(TIME_ZONE))
+        now = dt_util.now(await dt_util.async_get_time_zone(TIME_ZONE))
+        # Through tomorrow, so the walk certainly covers today's hours.
+        end = now + timedelta(days=1)
         try:
             reads = await self.api.async_get_usage_reads(
                 meter,
                 AggregateType.HOUR,
-                end - HOURLY_MAX_HISTORY,
+                now - HOURLY_MAX_HISTORY,
                 end,
                 window_days=HOURLY_WINDOW_DAYS,
                 strict=True,
             )
             daily = await self.api.async_get_usage_reads(
-                meter, AggregateType.DAY, end - DAILY_HISTORY, end, strict=True
+                meter, AggregateType.DAY, now - DAILY_HISTORY, end, strict=True
             )
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning(
@@ -300,8 +325,10 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             if not valid_statistic_id(statistic_id):
                 _LOGGER.warning("Invalid statistic id: %s", statistic_id)
                 continue
-            points = self._hourly_points(reads, attr)
-            if not await self._rebuild_is_safe(statistic_id, points):
+            points = await self._plan_rebuild(
+                statistic_id, self._hourly_points(reads, attr)
+            )
+            if points is None:
                 self._count_refusal(statistic_id)
                 continue
             metadata = self._statistic_metadata(meter, statistic_id, label)
@@ -334,8 +361,18 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             current += timedelta(hours=1)
         return points
 
-    async def _rebuild_is_safe(self, statistic_id, points) -> bool:
-        """Refuse if old rows would survive outside the new range with stale sums."""
+    @staticmethod
+    def _local(moment: datetime) -> str:
+        return moment.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+
+    async def _plan_rebuild(self, statistic_id, points) -> list[StatisticData] | None:
+        """The points to write, or None if old rows would keep a stale sum.
+
+        Rows before the walk's first point would survive untouched, so refuse. Rows
+        a few hours after its last point are data lag (live updates saw hours the
+        walk did not), so they are carried into the same write with their own
+        states, summed on from the rebuilt chain.
+        """
         recorder = get_instance(self.hass)
         first, last = points[0]["start"], points[-1]["start"]
         before = await recorder.async_add_executor_job(
@@ -348,28 +385,61 @@ class CsuCoordinator(DataUpdateCoordinator[dict[str, UsageRead]]):
             None,
             {"sum"},
         )
-        newest = await recorder.async_add_executor_job(
-            get_last_statistics, self.hass, 1, statistic_id, False, set()
-        )
-        newest_start = newest[statistic_id][0]["start"] if newest else None
-        if before.get(statistic_id) or (
-            newest_start is not None and newest_start > last.timestamp()
-        ):
-            oldest = (
-                before[statistic_id][0]["start"] if before.get(statistic_id) else None
+        if before.get(statistic_id):
+            oldest = datetime.fromtimestamp(
+                before[statistic_id][0]["start"], tz=timezone.utc
             )
             _LOGGER.warning(
-                "Not rebuilding %s: the history walk covered %s to %s, but existing "
-                "rows reach outside that (oldest row before it: %s)",
+                "Not rebuilding %s: the history walk covered %s to %s, but there "
+                "are rows before it (the oldest is %s)",
                 statistic_id,
-                first.date(),
-                last.date(),
-                datetime.fromtimestamp(oldest, tz=timezone.utc).date()
-                if oldest is not None
-                else "none",
+                self._local(first),
+                self._local(last),
+                self._local(oldest),
             )
-            return False
-        return True
+            return None
+        after = await recorder.async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            last + timedelta(hours=1),
+            None,
+            {statistic_id},
+            "hour",
+            None,
+            {"state"},
+        )
+        tail = after.get(statistic_id, [])
+        if not tail:
+            return points
+        newest = datetime.fromtimestamp(tail[-1]["start"], tz=timezone.utc)
+        if newest - last > REBUILD_MAX_TAIL:
+            _LOGGER.warning(
+                "Not rebuilding %s: the history walk ended at %s, but there are rows "
+                "up to %s",
+                statistic_id,
+                self._local(last),
+                self._local(newest),
+            )
+            return None
+        running_sum = points[-1]["sum"]
+        carried = []
+        for row in tail:
+            state = row["state"] or 0.0
+            running_sum += state
+            carried.append(
+                StatisticData(
+                    start=datetime.fromtimestamp(row["start"], tz=timezone.utc),
+                    state=state,
+                    sum=running_sum,
+                )
+            )
+        _LOGGER.info(
+            "%s: carrying %d existing rows after %s into the rebuild",
+            statistic_id,
+            len(carried),
+            self._local(last),
+        )
+        return points + carried
 
     def _count_refusal(self, statistic_id: str) -> None:
         """Remember a refusal so a series that can never rebuild stops retrying."""

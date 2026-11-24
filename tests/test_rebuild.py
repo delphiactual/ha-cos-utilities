@@ -17,20 +17,25 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_PASSWORD
 from homeassistant.const import CONF_USERNAME
 from homeassistant.core import HomeAssistant
+from homeassistant.loader import async_get_integration
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.csu.const import CONF_ACCESS_TOKEN
 from custom_components.csu.const import CONF_HOURLY_REBUILD_DONE
 from custom_components.csu.const import CONF_HOURLY_REBUILD_REFUSED
+from custom_components.csu.const import CONF_HOURLY_REBUILD_VERSION
 from custom_components.csu.const import DOMAIN
 from custom_components.csu.coordinator import CsuCoordinator
 from custom_components.csu.coordinator import DAILY_HISTORY
+from custom_components.csu.coordinator import HOURLY_WINDOW_DAYS
+from custom_components.csu.coordinator import REBUILD_MAX_TAIL
 from custom_components.csu.coordinator import REBUILD_MAX_REFUSALS
 from custom_components.csu.csu import AggregateType
 from custom_components.csu.csu import CostRead
 from custom_components.csu.csu import CSU
 from custom_components.csu.csu import CsuCustomer
+from custom_components.csu.csu import LOCAL_TZ
 from custom_components.csu.csu import Meter
 from custom_components.csu.csu import MeterType
 from custom_components.csu.csu import ReadResolution
@@ -89,6 +94,8 @@ class FakeCsu:
         self.hours = 40 * 24
         self.fail_deep = False
         self.deep_calls = Counter()
+        self.deep_windows = []
+        self.deep_ends = []
         self.water_hour_calls = 0
         self.water_day_spans = []
         self.elec = _meter(1, MeterType.ELEC, ReadResolution.QUARTER_HOUR)
@@ -176,6 +183,8 @@ class FakeCsu:
             # A full-history fetch ignores the range, like the real walk does.
             if hourly:
                 self.deep_calls[meter.meter_type] += 1
+                self.deep_windows.append(kwargs.get("window_days"))
+                self.deep_ends.append(end)
                 if self.fail_deep:
                     raise CannotConnect("fake outage")
             return reads
@@ -411,8 +420,9 @@ async def test_walk_that_stops_early_is_logged_and_given_up_after_three_starts(
     assert entry.data[CONF_HOURLY_REBUILD_REFUSED] == {IMPORT_ID: 1}
     assert IMPORT_ID not in entry.data[CONF_HOURLY_REBUILD_DONE]
     # The log names where the walk started and the old row it would have left.
-    assert str(fake.base.date()) in caplog.text
-    assert str(older.date()) in caplog.text
+    # Local time, not UTC, so the dates match what the user sees.
+    assert fake.base.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M") in caplog.text
+    assert older.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M") in caplog.text
     # The old rows were not touched.
     assert len(await _rows(hass, IMPORT_ID)) >= 3
     assert not hass.config_entries.flow.async_progress_by_handler(DOMAIN)
@@ -441,3 +451,131 @@ async def test_water_is_not_rebuilt_and_daily_history_is_two_years(
     # The first import asks for exactly two years, not three.
     assert DAILY_HISTORY in fake.water_day_spans
     assert all(span <= DAILY_HISTORY for span in fake.water_day_spans)
+
+
+async def test_walk_uses_short_windows_and_reaches_tomorrow(
+    recorder_mock, enable_custom_integrations, hass, entry, fake, patched_api
+):
+    await _setup(hass, entry)
+
+    # Long ranges come back from CSU with missing reads and a stale tail.
+    assert HOURLY_WINDOW_DAYS <= 14
+    assert set(fake.deep_windows) == {HOURLY_WINDOW_DAYS}
+    ahead = fake.deep_ends[0] - dt_util.now()
+    assert timedelta(hours=23) < ahead < timedelta(hours=25)
+
+
+def _entry(hass, **extra):
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_USERNAME: "user@example.test",
+            CONF_PASSWORD: "fake-password",
+            **extra,
+        },
+    )
+    entry.add_to_hass(hass)
+    return entry
+
+
+async def _seed_hourly(hass, fake, statistic_id, hours, state=0.2):
+    """Old rows in hourly form, e.g. written by live updates."""
+    start = fake.base
+    points, running = [], 1000.0
+    for i in hours:
+        running += state
+        points.append(StatisticData(start=start + i * HOUR, state=state, sum=running))
+    metadata = CsuCoordinator._statistic_metadata(
+        fake.elec, statistic_id, SERIES[statistic_id][1]
+    )
+    async_add_external_statistics(hass, metadata, points)
+    await get_instance(hass).async_block_till_done()
+
+
+def _check_chain(rows):
+    """Each row's sum is the previous sum plus its own state."""
+    for previous, row in zip(rows, rows[1:]):
+        assert row["sum"] == pytest.approx(previous["sum"] + row["state"])
+
+
+async def test_rows_past_the_walk_are_carried_into_the_rebuild(
+    recorder_mock, enable_custom_integrations, hass, fake, patched_api, caplog
+):
+    # Live updates saw 5 hours the walk did not (data lag).
+    await _seed_hourly(hass, fake, IMPORT_ID, range(fake.hours + 5))
+    entry = _entry(hass)
+
+    with caplog.at_level(logging.INFO):
+        coordinator = await _setup(hass, entry)
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert IMPORT_ID in entry.data[CONF_HOURLY_REBUILD_DONE]
+    assert not entry.data.get(CONF_HOURLY_REBUILD_REFUSED)
+    assert "carrying 5 existing rows" in caplog.text
+    rows = await _rows(hass, IMPORT_ID)
+    assert len(rows) == fake.hours + 5
+    # The walk itself is complete and exact; the tail keeps its own states and
+    # carries on from the rebuilt chain, so nothing keeps an old sum.
+    _check_history(fake, rows[: fake.hours], "consumption")
+    assert [r["state"] for r in rows[fake.hours :]] == pytest.approx([0.2] * 5)
+    _check_chain(rows)
+    rebuilt = [r["sum"] for r in rows[: fake.hours]]
+
+    # The next live update replaces the tail with real reads, from the same chain.
+    fake.hours += 24
+    await coordinator._insert_statistics()
+    await get_instance(hass).async_block_till_done()
+
+    rows = await _rows(hass, IMPORT_ID)
+    _check_history(fake, rows, "consumption")
+    assert [r["sum"] for r in rows[: len(rebuilt)]] == pytest.approx(rebuilt)
+
+
+async def test_rows_far_past_the_walk_are_refused(
+    recorder_mock, enable_custom_integrations, hass, fake, patched_api, caplog
+):
+    far = fake.hours + int(REBUILD_MAX_TAIL.total_seconds() // 3600) + 12
+    await _seed_hourly(hass, fake, IMPORT_ID, [fake.hours + 1, far])
+    entry = _entry(hass)
+
+    with caplog.at_level(logging.WARNING):
+        await _setup(hass, entry)
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert entry.data[CONF_HOURLY_REBUILD_REFUSED] == {IMPORT_ID: 1}
+    assert IMPORT_ID not in entry.data[CONF_HOURLY_REBUILD_DONE]
+    assert "Not rebuilding" in caplog.text
+
+
+async def test_a_new_release_gets_fresh_rebuild_tries(
+    recorder_mock, enable_custom_integrations, hass, fake, patched_api
+):
+    entry = _entry(
+        hass,
+        **{
+            CONF_HOURLY_REBUILD_VERSION: "0.0.1",
+            CONF_HOURLY_REBUILD_REFUSED: {IMPORT_ID: 3},
+        },
+    )
+
+    await _setup(hass, entry)
+
+    version = str((await async_get_integration(hass, DOMAIN)).version)
+    assert entry.data[CONF_HOURLY_REBUILD_VERSION] == version
+    assert CONF_HOURLY_REBUILD_REFUSED not in entry.data
+    assert IMPORT_ID in entry.data[CONF_HOURLY_REBUILD_DONE]
+    assert fake.deep_calls[MeterType.ELEC] == 1
+
+
+async def test_electric_rebuilt_by_0_3_0_or_0_3_1_is_redone_but_gas_is_kept(
+    recorder_mock, enable_custom_integrations, hass, fake, patched_api
+):
+    # No stored version means the flags came from 0.3.0 or 0.3.1, whose electric
+    # walk used windows that were too long to be complete.
+    entry = _entry(hass, **{CONF_HOURLY_REBUILD_DONE: [IMPORT_ID, EXPORT_ID, GAS_ID]})
+
+    await _setup(hass, entry)
+
+    assert fake.deep_calls[MeterType.ELEC] == 1
+    assert fake.deep_calls[MeterType.GAS] == 0
+    assert set(entry.data[CONF_HOURLY_REBUILD_DONE]) == {IMPORT_ID, EXPORT_ID, GAS_ID}
