@@ -70,6 +70,14 @@ python scripts/smoke_test.py [days]
 
 ![example][exampleimg]
 
+## Recorded fixtures (development)
+
+Tests that need CSU's real responses use fixtures recorded from a live account, never hand-written guesses. The test suite makes no network calls.
+
+1. `CSU_USERNAME=... CSU_PASSWORD=... python scripts/record_fixtures.py` calls the same endpoints and windows the integration uses and saves every raw response, one file per request window, under `fixtures_raw/` (gitignored, contains account data, never commit it). It takes about 25 minutes. A one-time code can be given as `CSU_MFA` or typed when asked.
+2. `python scripts/scrub_fixtures.py fixtures_raw/<capture>` writes only the windows the tests need to `tests/fixtures/`: the last 7 days including today, a spring and a fall DST week, a week with null export values, an empty week, and the weeks around the start of service. Customer, meter, service and contract identifiers, the account context, tokens, names and addresses are swapped for fakes; everything else stays as recorded. It then searches its own output for every original value and deletes it and fails if any is left.
+3. `tests/fixture_csu.py` serves those files by request window to the real client code. A window that was not recorded is an error, not a guess.
+
 ## Installation
 
 1. Using the tool of choice open the directory (folder) for your HA configuration (where you find `configuration.yaml`).

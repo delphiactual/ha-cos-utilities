@@ -5,3 +5,6 @@ pythonenv*
 venv
 .venv
 .env
+
+# Raw CSU captures hold account data and must never be committed
+fixtures_raw/
