@@ -219,7 +219,14 @@ class FakeCsu:
                 if self.fail_deep:
                     raise CannotConnect("fake outage")
             return reads
-        # The real endpoint works in whole days.
+        # The real endpoint works in whole local days.
+        if hourly:
+            first, last = start.date(), end.date()
+            return [
+                r
+                for r in reads
+                if first <= r.start_time.astimezone(LOCAL_TZ).date() <= last
+            ]
         first = start.astimezone(UTC).date()
         last = end.astimezone(UTC).date()
         return [r for r in reads if first <= r.start_time.date() <= last]
