@@ -612,9 +612,18 @@ class CSU:
         if not reads:
             return []
         if meter.meter_type == MeterType.ELEC and daily_reads:
-            # Only days inside the hourly range.
+            # Only days inside the range that hourly reads exist for: a day with none
+            # is a failed or not yet posted window, and a spread of its daily total
+            # would replace the hours already stored for it.
+            covered = {r.start_time.date() for r in reads}
             reads = reconcile_hourly_with_daily(
-                reads, [r for r in daily_reads if r.start_time.date() >= start.date()]
+                reads,
+                [
+                    r
+                    for r in daily_reads
+                    if r.start_time.date() >= start.date()
+                    and r.start_time.date() in covered
+                ],
             )
         window_start = datetime.combine(
             start.date(), datetime.min.time(), tzinfo=start.tzinfo
